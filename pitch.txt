@@ -1,0 +1,10 @@
+Cohort-based programs generate a ton of curriculum, but there’s no good way for students to actually use it once they get stuck.
+Everything lives in different formats like PDFs, markdown files, quizzes, and rubrics, and when someone has a question, they can’t easily find the exact piece they need. So they either spin their wheels or go looking for answers instead of learning.
+What we built is a system that organizes that content and makes it usable.
+At the Bronze layer, we take the raw curriculum as it is.
+ At the Silver layer, we ingest it, extract the text, clean it up, remove duplicates, and break it into chunks. We tag those chunks with metadata like week, topic, and assignment type.
+ At the Gold layer, that content is stored in a vector database and made searchable.
+When a student asks a question, we retrieve the most relevant curriculum first. Then we pass that through a guardrail layer that enforces the main rule, no direct answers.
+The system responds by guiding the student. It might ask a question back, point them to a specific section, or help them think through the problem. It always ties back to the curriculum so they stay grounded in the material.
+At the same time, we log every interaction. That feeds into an admin view where instructors can see what people are asking, where they’re getting stuck, and where the system is blocking answer-seeking behavior.
+So instead of a chatbot that gives answers, this is a pipeline that takes messy curriculum, makes it searchable, and controls how the model interacts with students so it actually supports learning.
