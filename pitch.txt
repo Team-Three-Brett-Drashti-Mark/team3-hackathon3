@@ -1,10 +1,29 @@
-Cohort-based programs generate a ton of curriculum, but there’s no good way for students to actually use it once they get stuck.
-Everything lives in different formats like PDFs, markdown files, quizzes, and rubrics, and when someone has a question, they can’t easily find the exact piece they need. So they either spin their wheels or go looking for answers instead of learning.
-What we built is a system that organizes that content and makes it usable.
-At the Bronze layer, we take the raw curriculum as it is.
- At the Silver layer, we ingest it, extract the text, clean it up, remove duplicates, and break it into chunks. We tag those chunks with metadata like week, topic, and assignment type.
- At the Gold layer, that content is stored in a vector database and made searchable.
-When a student asks a question, we retrieve the most relevant curriculum first. Then we pass that through a guardrail layer that enforces the main rule, no direct answers.
-The system responds by guiding the student. It might ask a question back, point them to a specific section, or help them think through the problem. It always ties back to the curriculum so they stay grounded in the material.
-At the same time, we log every interaction. That feeds into an admin view where instructors can see what people are asking, where they’re getting stuck, and where the system is blocking answer-seeking behavior.
-So instead of a chatbot that gives answers, this is a pipeline that takes messy curriculum, makes it searchable, and controls how the model interacts with students so it actually supports learning.
+MARK — OPEN (Problem + User) ~1.5 min
+Cohort-based programs generate a lot of curriculum, but once it’s delivered, it becomes hard to actually use.
+Students hit a point where they’re stuck, and they don’t know where to go back in the material to figure it out. Everything is spread across PDFs, markdown files, quizzes, and rubrics. So instead of learning, they either spin their wheels or go looking for answers somewhere else.
+At the same time, instructors have no visibility into what’s actually happening. They see final submissions, but not where students struggled to get there.
+So the two users we’re solving for are students who need help during learning, and admins who need visibility into that process.
+
+BRETT — SOLUTION + UX ~2 min
+We built a private learning assistant that sits directly on top of the program’s curriculum.
+Students can ask questions in natural language, but instead of giving answers, the system guides them. It points them to the right material, asks follow-up questions, and helps them think through the problem.
+From the student side, the experience is simple. They ask a question, and the system responds with guidance. It might point them to a specific lesson, ask a clarifying question, or walk them through how to think about the problem.
+From the admin side, we surface what’s actually happening. You can see what topics are being asked the most, where students are getting stuck, where the system is blocking answer-seeking behavior, and which parts of the curriculum are being heavily referenced.
+Everything is designed to be usable by a non-technical user.
+
+MARK — ARCHITECTURE + INPUT/OUTPUT ~2.5 min
+We designed this as a Bronze, Silver, Gold pipeline.
+At the Bronze layer, we take the raw curriculum as it exists. PDFs, markdown, quizzes, and rubrics.
+At the Silver layer, we process that content. We extract text, clean it, remove duplicates, and break it into smaller chunks. Then we add metadata like week, topic, and assignment type so it becomes structured and searchable.
+At the Gold layer, that content is stored in a vector database and connected to a retriever.
+When a student asks a question, we retrieve the most relevant curriculum first. Then we pass that through a guardrail layer that enforces the rule of no direct answers.
+Only after that does it go to the LLM, which generates a guided response based on the retrieved material.
+In terms of inputs and outputs, the inputs are raw curriculum and student questions.
+The output is not a direct answer. It’s a guided response tied back to the curriculum, along with system logs that feed into admin insights.
+
+DRASTHI — SCOPE + CLOSE ~1 min
+For MVP, we focused on the core system.
+We built ingestion for PDFs and markdown, implemented chunking and metadata tagging, set up vector search and retrieval, added a guardrail layer, and built logging for admin visibility.
+We intentionally did not focus on things like full UI polish or advanced analytics yet. The goal was to prove the core system works.
+This isn’t just a chatbot.
+It’s a pipeline that takes messy curriculum, makes it searchable, and controls how the model interacts with students so it actually supports learning instead of replacing it.
