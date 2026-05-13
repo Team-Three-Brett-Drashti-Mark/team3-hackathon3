@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useRef } from "react";
 
 export default function App() {
   // ============================================================================
@@ -71,6 +71,8 @@ len(word)      → 6
 
   const [prompt, setPrompt] = useState("");
   const [chat, setChat] = useState([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const attemptRef = useRef(1); // tracks guardrail escalation per-session
 
   const currentQuestion = QUESTIONS[qIndex];
 
@@ -131,6 +133,7 @@ len(word)      → 6
     setFeedback(null);
     setNextEnabled(false);
     setChat([]);
+    attemptRef.current = 1; // reset guardrail counter on new question
   };
 
   const jumpToQuestion = (index) => {
@@ -138,23 +141,49 @@ len(word)      → 6
     resetQuestionState();
   };
 
-  const sendPrompt = () => {
-    if (!prompt.trim()) return;
+  const sendPrompt = async () => {
+    if (!prompt.trim() || isLoading) return;
 
-    const updatedChat = [
-      ...chat,
-      {
-        role: "user",
-        text: prompt,
-      },
-      {
-        role: "hint",
-        text: currentQuestion.hint,
-      },
-    ];
-
-    setChat(updatedChat);
+    const userMessage = prompt.trim();
     setPrompt("");
+    setIsLoading(true);
+
+    // Optimistically add the user message to chat
+    setChat((prev) => [...prev, { role: "user", text: userMessage }]);
+
+    try {
+      const res = await fetch("http://localhost:8000/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_input: userMessage,
+          attempt: attemptRef.current,
+        }),
+      });
+
+      const data = await res.json();
+
+      // Escalate attempt counter if the student was seeking a direct answer
+      if (data.intent === "answer_seeking" && attemptRef.current < 3) {
+        attemptRef.current += 1;
+      }
+
+      setChat((prev) => [
+        ...prev,
+        { role: "hint", text: data.response_text, intent: data.intent },
+      ]);
+    } catch (err) {
+      setChat((prev) => [
+        ...prev,
+        {
+          role: "hint",
+          text: "⚠️ Could not reach the Pathwise backend. Make sure the API server is running on port 8000.",
+          intent: "error",
+        },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   // ============================================================================
@@ -372,19 +401,19 @@ len(word)      → 6
                     <div>
                       <div
                         style={{
-                          color: colors.teal,
+                          color: msg.intent === "error" ? colors.errorFg : colors.teal,
                           fontWeight: 700,
                           marginBottom: 4,
                         }}
                       >
-                        Hint
+                        Pathwise
                       </div>
 
                       <div
                         style={{
                           whiteSpace: "pre-wrap",
                           color: colors.code,
-                          fontFamily: "monospace",
+                          lineHeight: 1.6,
                         }}
                       >
                         {msg.text}
@@ -393,6 +422,13 @@ len(word)      → 6
                   )}
                 </div>
               ))}
+
+              {/* Loading indicator */}
+              {isLoading && (
+                <div style={{ color: colors.muted, fontStyle: "italic", fontSize: 13 }}>
+                  Pathwise is thinking…
+                </div>
+              )}
             </div>
 
             <div
