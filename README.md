@@ -58,3 +58,19 @@ Our solution targets four core users:
 - `/ux_workflows`: User experience flows for our personas (Marcus & Sandra).
 - `/presentation`: Pitch decks and hackathon presentations.
 - Documentation for personas, tech stack, problem statements, and MVP scopes are available in the root folder.
+
+
+Installation
+
+Clone the repository and install dependencies:
+
+npm install
+Running the App
+
+Start the development server:
+
+npm run dev
+
+Open the local development URL shown in the terminal, usually:
+
+http://localhost:5173
