@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from main import build_graph, PathwiseState
+from app.main import build_graph, PathwiseState
 
 
 # =============================================================================
