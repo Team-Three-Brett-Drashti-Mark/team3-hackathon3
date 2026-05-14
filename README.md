@@ -59,18 +59,20 @@ Our solution targets four core users:
 - `/presentation`: Pitch decks and hackathon presentations.
 - Documentation for personas, tech stack, problem statements, and MVP scopes are available in the root folder.
 
+## Installation
 
-Installation
+Clone the repository, create a virtual environment, and install backend and frontend dependencies (see setup instructions if needed).
 
-Clone the repository and install dependencies:
+## Running the App
 
-npm install
-Running the App
+We provide a convenient bash script to start both the FastAPI backend and the Vite frontend simultaneously.
 
-Start the development server:
+From the project root, run:
 
-npm run dev
+```bash
+bash start.sh
+```
 
-Open the local development URL shown in the terminal, usually:
-
-http://localhost:5173
+This will start:
+- **Frontend:** http://localhost:5173
+- **Backend:** http://localhost:8000
