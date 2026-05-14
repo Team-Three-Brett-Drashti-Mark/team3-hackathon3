@@ -31,7 +31,7 @@ sleep 1
 # ---------------------------------------------------------------------------
 echo "Starting backend (FastAPI) on http://localhost:8000 ..."
 cd "$PROJECT_ROOT"
-uvicorn app.main:app --port 8000 &
+uvicorn app.api:app --port 8000 &
 BACKEND_PID=$!
 
 # Wait until the backend is actually accepting connections
