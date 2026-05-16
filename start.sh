@@ -49,7 +49,7 @@ done
 # Start frontend
 # ---------------------------------------------------------------------------
 echo "Starting frontend (Vite) on http://localhost:5173 ..."
-cd "$PROJECT_ROOT/pathwise-react"
+cd "$PROJECT_ROOT/frontend"
 npm run dev &
 FRONTEND_PID=$!
 
