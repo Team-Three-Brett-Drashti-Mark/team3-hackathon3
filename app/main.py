@@ -3,14 +3,14 @@ from langgraph.graph import END, START, StateGraph
 from dotenv import load_dotenv
 import os
 
-# Load GROQ_API_KEY from .env (works from any working directory)
+# Load environment variables from .env (works from any working directory)
 _env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 load_dotenv(_env_path)
 
-# Also load guardrails from the sibling package
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from guardrails.no_direct_answers import guide_response, structured_hint, hard_block
+from retrieval.retriever import retrieve
 
 
 # =============================================================================
@@ -18,10 +18,12 @@ from guardrails.no_direct_answers import guide_response, structured_hint, hard_b
 # =============================================================================
 
 class PathwiseState(TypedDict):
-    user_input: str       # Raw message from the student
-    intent: str           # "answer_seeking" | "curriculum" | "off_topic"
-    attempt: int          # Guardrail escalation counter (1 → 2 → 3)
-    response_text: str    # Final response sent back to the student
+    user_input: str         # Raw message from the student
+    lesson_context: str     # Problem/exercise text the student is working on
+    retrieved_chunks: list  # Relevant curriculum chunks from vector search
+    intent: str             # "answer_seeking" | "curriculum" | "off_topic"
+    attempt: int            # Guardrail escalation counter (1 → 2 → 3)
+    response_text: str      # Final response sent back to the student
 
 
 # =============================================================================
@@ -51,7 +53,7 @@ def classify_intent(state: PathwiseState) -> dict:
     return {"intent": "curriculum"}
 
 
-def off_topic_handler(state: PathwiseState) -> dict:
+def off_topic_handler(_state: PathwiseState) -> dict:
     return {
         "response_text": (
             "I'm Pathwise, your Python learning assistant! "
@@ -61,19 +63,31 @@ def off_topic_handler(state: PathwiseState) -> dict:
     }
 
 
-def choose_path(
+def retrieve_context(state: PathwiseState) -> dict:
+    """Fetch relevant curriculum chunks from Databricks Vector Search."""
+    # Combine the lesson context with the student's question for a richer query
+    query = state["user_input"]
+    if state.get("lesson_context"):
+        query = f"{state['lesson_context']}\n{state['user_input']}"
+    chunks = retrieve(query, k=3)
+    return {"retrieved_chunks": chunks}
+
+
+def route_intent(
     state: PathwiseState,
-) -> Literal["guide_response", "structured_hint", "hard_block", "off_topic_handler"]:
-    """Conditional edge: pick next node based on intent and attempt count."""
+) -> Literal["off_topic_handler", "hard_block", "retrieve_context"]:
+    """Skip retrieval for off-topic messages and hard blocks (static responses)."""
     if state["intent"] == "off_topic":
         return "off_topic_handler"
-    if state["intent"] == "curriculum":
-        return "guide_response"
-    # answer_seeking — escalate
-    attempt = state.get("attempt", 1)
-    if attempt >= 3:
+    if state["intent"] == "answer_seeking" and state.get("attempt", 1) >= 3:
         return "hard_block"
-    elif attempt == 2:
+    return "retrieve_context"
+
+
+def choose_response(
+    state: PathwiseState,
+) -> Literal["guide_response", "structured_hint"]:
+    if state["intent"] == "answer_seeking" and state.get("attempt", 1) == 2:
         return "structured_hint"
     return "guide_response"
 
@@ -85,12 +99,15 @@ def choose_path(
 def build_graph() -> StateGraph:
     builder = StateGraph(PathwiseState)
     builder.add_node("classify_intent",   classify_intent)
+    builder.add_node("retrieve_context",  retrieve_context)
     builder.add_node("guide_response",    guide_response)
     builder.add_node("structured_hint",   structured_hint)
     builder.add_node("hard_block",        hard_block)
     builder.add_node("off_topic_handler", off_topic_handler)
+
     builder.add_edge(START, "classify_intent")
-    builder.add_conditional_edges("classify_intent", choose_path)
+    builder.add_conditional_edges("classify_intent", route_intent)
+    builder.add_conditional_edges("retrieve_context", choose_response)
     builder.add_edge("guide_response",    END)
     builder.add_edge("structured_hint",   END)
     builder.add_edge("hard_block",        END)

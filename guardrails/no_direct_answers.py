@@ -22,29 +22,44 @@ def _groq_client() -> Groq:
     return Groq(api_key=api_key)
 
 
+def _build_context_block(state: dict) -> str:
+    """Assembles lesson context and retrieved curriculum chunks into a prompt block."""
+    parts = []
+    if state.get("lesson_context"):
+        parts.append(f"The student is currently working on this exercise:\n{state['lesson_context']}")
+    chunks = state.get("retrieved_chunks") or []
+    if chunks:
+        joined = "\n\n".join(chunks)
+        parts.append(f"Relevant curriculum material for reference:\n{joined}")
+    return "\n\n".join(parts)
+
+
 def guide_response(state: dict) -> dict:
     """
     Attempt 1 — Friendly coaching mode.
 
     The LLM is instructed to ask what the student has tried, point to the
     relevant concept, and encourage — without ever writing code or revealing
-    the answer.
-
-    Args:
-        state (dict): PathwiseState with at least 'user_input'.
-    Returns:
-        dict: {'response_text': str}
+    the answer. Lesson context and retrieved curriculum chunks are injected
+    so responses are grounded in the student's actual exercise.
     """
     client = _groq_client()
+    context_block = _build_context_block(state)
+
     prompt = (
         "You are Pathwise, a supportive Python learning assistant for a coding bootcamp. "
         "Your absolute rule: NEVER give direct answers, write code, or reveal solutions. "
         "Your goal is to help students think, not to think for them.\n\n"
+    )
+    if context_block:
+        prompt += f"{context_block}\n\n"
+    prompt += (
         "Respond in 2-4 sentences. Start by acknowledging the question warmly, "
         "then ask what the student has already tried, and hint at the relevant concept "
-        "they should explore — without spelling out how to apply it.\n\n"
+        "from the material above they should explore — without spelling out how to apply it.\n\n"
         f"Student question: {state['user_input']}"
     )
+
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
@@ -58,24 +73,27 @@ def structured_hint(state: dict) -> dict:
 
     The student has asked more than once. The LLM names the concept,
     explains it briefly, gives an analogous (but different) code example,
-    and ends with a guiding question — still no direct answer.
-
-    Args:
-        state (dict): PathwiseState with at least 'user_input'.
-    Returns:
-        dict: {'response_text': str}
+    and ends with a guiding question — still no direct answer. Grounded
+    in the student's lesson context and retrieved curriculum chunks.
     """
     client = _groq_client()
+    context_block = _build_context_block(state)
+
     prompt = (
         "You are Pathwise, a Python learning assistant. This is the student's second request "
         "for help on a similar topic, so they need more structured guidance — but still NO direct answers.\n\n"
+    )
+    if context_block:
+        prompt += f"{context_block}\n\n"
+    prompt += (
         "Follow this structure in your response:\n"
-        "1. Name the key concept they need (e.g., 'This involves string slicing').\n"
+        "1. Name the key concept they need (draw from the material above if relevant).\n"
         "2. Explain that concept in 1-2 plain-English sentences.\n"
         "3. Give a SHORT analogous example using DIFFERENT values than the student's question.\n"
         "4. End with a guiding question that nudges them toward solving their own problem.\n\n"
         f"Student question: {state['user_input']}"
     )
+
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
@@ -83,17 +101,12 @@ def structured_hint(state: dict) -> dict:
     return {"response_text": response.choices[0].message.content}
 
 
-def hard_block(state: dict) -> dict:
+def hard_block(_state: dict) -> dict:
     """
     Attempt 3 — Hard block. No LLM call.
 
     After three answer-seeking attempts the student is redirected to
     conceptual review and their instructor. No further hints.
-
-    Args:
-        state (dict): PathwiseState (unused, but included for graph consistency).
-    Returns:
-        dict: {'response_text': str}
     """
     return {
         "response_text": (

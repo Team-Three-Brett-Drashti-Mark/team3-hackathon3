@@ -24,6 +24,7 @@ graph = build_graph()
 
 class ChatRequest(BaseModel):
     user_input: str
+    lesson_context: str = ""
     attempt: int = 1
 
 
@@ -47,6 +48,8 @@ def chat(req: ChatRequest):
     result = graph.invoke(
         PathwiseState(
             user_input=req.user_input,
+            lesson_context=req.lesson_context,
+            retrieved_chunks=[],
             intent="",
             attempt=req.attempt,
             response_text="",
