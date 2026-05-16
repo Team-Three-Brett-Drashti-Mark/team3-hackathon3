@@ -236,3 +236,12 @@ dmypy.json
 .pyre/
 .pytype/
 cython_debug/
+
+.databricks
+.agents
+.ai-dev-kit
+.claude
+.github
+typings/
+.mcp.json
+databricks.yml
