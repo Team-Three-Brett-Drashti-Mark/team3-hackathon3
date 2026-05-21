@@ -1,0 +1,15 @@
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #ecc058;
+  outline-offset: 2px;
+}
+
+@keyframes thinking-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+
+.thinking {
+  animation: thinking-pulse 1.4s ease-in-out infinite;
+}
