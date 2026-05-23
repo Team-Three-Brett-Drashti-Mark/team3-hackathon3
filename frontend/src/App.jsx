@@ -64,6 +64,9 @@ s[::2]           every other char
   const [hovered, setHovered] = useState(null);
 
   const attemptRef = useRef(1);
+  // New UUID per question — groups all chat turns for one question into a single
+  // session without storing any user identity. Resets when the student moves on.
+  const sessionIdRef = useRef(crypto.randomUUID());
   const chatEndRef = useRef(null);
 
   const currentQuestion = QUESTIONS[qIndex];
@@ -113,6 +116,7 @@ s[::2]           every other char
     setNextEnabled(false);
     setChat([]);
     attemptRef.current = 1;
+    sessionIdRef.current = crypto.randomUUID();
   };
 
   const jumpToQuestion = (index) => {
@@ -139,13 +143,15 @@ s[::2]           every other char
         content: m.text,
       }));
 
-      const res = await fetch("http://localhost:8000/chat", {
+      const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+      const res = await fetch(`${apiBaseUrl}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           user_input: userMessage,
           lesson_context: currentQuestion.text,
           attempt: attemptRef.current,
+          session_id: sessionIdRef.current,
           conversation_history,
         }),
       });
