@@ -281,3 +281,78 @@ team3-hackathon3/
 - Admin controls (instant curriculum updates)
 - Instructor layer (common misconceptions report)
 - Better product experience (UI/UX polish, mobile responsiveness)
+
+# Pathwise — Test Suite
+
+## Structure
+
+```
+tests/
+├── conftest.py               # Shared fixtures (mock Groq, mock retriever, base states)
+├── test_classifier.py        # classify_intent + route_intent unit tests
+├── test_guardrails.py        # Guardrail node unit tests (leak detection, fallbacks, hard block)
+├── test_retriever.py         # Retriever unit tests (_parse_metadata, retrieve(), chunk filtering)
+├── test_api.py               # FastAPI /health + /chat integration tests
+├── test_logger.py            # Logger unit tests (format, append, edge cases)
+└── test_graph_integration.py # Full end-to-end graph tests (all escalation paths)
+```
+
+## Setup
+
+Activate your virtual environment then install the test dependency:
+
+```bash
+source venv/bin/activate          # Mac/Linux
+# venv\Scripts\activate           # Windows
+
+pip install pytest httpx
+```
+
+> `httpx` is required by FastAPI's `TestClient`.
+
+## Running Tests
+
+```bash
+# Run the entire suite from the project root
+pytest
+
+# Run a specific file
+pytest tests/test_classifier.py
+
+# Run a specific test class or function
+pytest tests/test_guardrails.py::TestHardBlock
+pytest tests/test_classifier.py::TestAnswerSeekingIntent::test_keyword_triggers
+
+# Stop on first failure
+pytest -x
+
+# Show print() output while running
+pytest -s
+
+# Quiet (dots only)
+pytest -q
+```
+
+## What Is Mocked
+
+All external I/O is patched so tests run fully offline:
+
+| Dependency | How mocked |
+|---|---|
+| Groq API | `monkeypatch` replaces `Groq(...)` with a `MagicMock` returning canned text |
+| Databricks Vector Search | `monkeypatch` replaces `retrieve()` with a list of hardcoded curriculum chunks |
+| `app.log` file | `monkeypatch` redirects `open("app.log")` to a `tmp_path` temp file |
+| FastAPI server | `TestClient` — no real HTTP server needed |
+
+## Test Coverage by Component
+
+| File | Tests |
+|---|---|
+| `app/main.py` — `classify_intent` | keyword triggers, off-topic, attempt escalation, server-side history re-count |
+| `app/main.py` — `route_intent` | all 5 routing branches |
+| `app/main.py` — `retrieve_context` | relevance filtering, fallback-to-best-chunk |
+| `guardrails/no_direct_answers.py` | leak detection, safe pass-through, hard block static guarantee, LLM fallbacks, history threading |
+| `retrieval/retriever.py` | metadata parsing, SDK call parameters, empty/error handling |
+| `app/api.py` | 200 responses, request validation, attempt echo, logging side-effect |
+| `app/logger.py` | file creation, field presence, append, unicode, edge cases |
+| Full graph | all intent paths, multi-turn context, state integrity guarantees |
