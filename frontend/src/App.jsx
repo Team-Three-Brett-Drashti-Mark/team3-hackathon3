@@ -143,7 +143,8 @@ s[::2]           every other char
         content: m.text,
       }));
 
-      const res = await fetch("http://localhost:8000/chat", {
+      const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+      const res = await fetch(`${apiBaseUrl}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

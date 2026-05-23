@@ -1,16 +1,19 @@
-import re
-from typing import TypedDict, Literal
-from langgraph.graph import END, START, StateGraph
-from dotenv import load_dotenv
 import os
-
-# Load environment variables from .env (works from any working directory)
-_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-load_dotenv(_env_path)
-
+import re
 import sys
+from typing import Literal, TypedDict
+
+from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
+
+# Prefer environment variables already injected by the runtime. For local
+# development, load a repo-root .env file if it exists.
+_env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(_env_path):
+    load_dotenv(_env_path, override=False)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from guardrails.no_direct_answers import curriculum_response, guide_response, structured_hint, hard_block
+from guardrails.no_direct_answers import curriculum_response, guide_response, hard_block, structured_hint
 from retrieval.retriever import retrieve
 
 

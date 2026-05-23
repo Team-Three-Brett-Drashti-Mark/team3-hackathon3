@@ -1,8 +1,13 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from app.main import build_graph, PathwiseState
+
 from app.logger import log_interaction
+from app.main import PathwiseState, build_graph
 
 
 # =============================================================================
@@ -21,6 +26,12 @@ app.add_middleware(
 
 # Build the graph once at startup — shared across all requests
 graph = build_graph()
+
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+_FRONTEND_INDEX = _FRONTEND_DIST / "index.html"
+
+if _FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="assets")
 
 
 class ChatRequest(BaseModel):
@@ -42,7 +53,10 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "frontend_built": _FRONTEND_INDEX.exists(),
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -76,3 +90,16 @@ def chat(req: ChatRequest):
         intent=result["intent"],
         attempt=req.attempt,
     )
+
+
+@app.get("/{full_path:path}")
+def serve_frontend(full_path: str):
+    if _FRONTEND_INDEX.exists():
+        requested = _FRONTEND_DIST / full_path
+        if full_path and requested.exists() and requested.is_file():
+            return FileResponse(requested)
+        return FileResponse(_FRONTEND_INDEX)
+    return {
+        "message": "Frontend build not found. Run `npm run build` in frontend/ before serving the app.",
+        "requested_path": full_path,
+    }

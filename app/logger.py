@@ -1,12 +1,14 @@
+import logging
 import os
 import uuid
-from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementState
 
 _executor = ThreadPoolExecutor(max_workers=2)
+_logger = logging.getLogger("pathwise.logger")
 
 _INSERT_SQL = """
 INSERT INTO capstone.logging.interaction_logs
@@ -67,14 +69,18 @@ def _get_warehouse_id(client: WorkspaceClient) -> str:
 def _fallback_log(session_id: str, user_input: str, system_output: str,
                   intent: str, attempt: int, error: str) -> None:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    message = (
+        f"[{timestamp}] [DELTA_FAIL: {error}]\n"
+        f"SESSION: {session_id}\n"
+        f"USER INPUT: {user_input}\n"
+        f"SYSTEM OUTPUT: {system_output}\n"
+        f"INTENT: {intent}\n"
+        f"ATTEMPT: {attempt}\n"
+        + "-" * 50
+    )
+    _logger.warning(message)
     with open(_FALLBACK_PATH, "a") as f:
-        f.write(f"[{timestamp}] [DELTA_FAIL: {error}]\n")
-        f.write(f"SESSION: {session_id}\n")
-        f.write(f"USER INPUT: {user_input}\n")
-        f.write(f"SYSTEM OUTPUT: {system_output}\n")
-        f.write(f"INTENT: {intent}\n")
-        f.write(f"ATTEMPT: {attempt}\n")
-        f.write("-" * 50 + "\n")
+        f.write(message + "\n")
 
 
 def log_interaction(session_id: str, user_input: str, system_output: str,
