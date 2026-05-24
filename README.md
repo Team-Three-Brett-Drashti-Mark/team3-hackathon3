@@ -259,24 +259,65 @@ ATTEMPT: ...
 ```text
 team3-hackathon3/
 ├── app/
-│   ├── api.py          # FastAPI app — /chat endpoint, hosted static serving, SPA fallback
-│   ├── logger.py       # Interaction logger with Delta write + stdout/app.log fallback
-│   └── main.py         # LangGraph graph and runtime env loading logic
+│   ├── api.py               # FastAPI app — /chat endpoint, hosted static serving, SPA fallback
+│   ├── logger.py            # Interaction logger with Delta write + stdout/app.log fallback
+│   └── main.py              # LangGraph graph and runtime env loading logic
 ├── frontend/
 │   ├── src/
-│   │   └── App.jsx     # React chat UI — uses relative /chat in hosted mode
-│   └── dist/           # Production build output served by FastAPI in Databricks Apps
+│   │   ├── App.jsx          # Root router — renders StudentApp now, ready for admin routing later
+│   │   ├── student/         # All student-facing UI (see Frontend Architecture below)
+│   │   └── admin/           # Admin view — placeholder for future work
+│   └── dist/                # Production build output served by FastAPI in Databricks Apps
 ├── guardrails/
 │   └── no_direct_answers.py
 ├── retrieval/
-│   └── retriever.py    # Databricks Vector Search client — returns chunks with metadata
-├── start.sh            # One-command local startup (Mac / Linux)
-├── start.ps1           # One-command local startup (Windows PowerShell)
-├── app.yaml            # Databricks Apps build/run manifest used from the repo root
-├── databricks.yml      # Declarative Automation Bundles config for workspace development
-├── requirements.txt    # Python backend dependencies
-└── .env                # Local secrets for development only — never commit this file
+│   └── retriever.py         # Databricks Vector Search client — returns chunks with metadata
+├── start.sh                 # One-command local startup (Mac / Linux)
+├── start.ps1                # One-command local startup (Windows PowerShell)
+├── app.yaml                 # Databricks Apps build/run manifest used from the repo root
+├── databricks.yml           # Declarative Automation Bundles config for workspace development
+├── requirements.txt         # Python backend dependencies
+└── .env                     # Local secrets for development only — never commit this file
 ```
+
+---
+
+## Frontend Architecture
+
+The React frontend is organized into a `student/` module under `frontend/src/`, with an `admin/` placeholder ready for future work. `App.jsx` at the root is a thin router that will switch between the two when the admin view is added.
+
+```text
+frontend/src/
+├── App.jsx                        # Root router — currently renders <StudentApp />
+├── App.css                        # Global styles (e.g. .thinking animation)
+├── student/
+│   ├── index.jsx                  # Student view root — layout, drag handles, transition handlers
+│   ├── data/
+│   │   └── lessonContent.js       # Lesson text, unit subtitle, and question definitions
+│   ├── services/
+│   │   └── chatApi.js             # Fetch call to /chat — plain async function, no React
+│   ├── hooks/
+│   │   ├── useQuiz.js             # Answer validation, progress, and question-navigation state
+│   │   └── useChat.js             # Chat history, session ID, loading state, and scroll effect
+│   ├── styles/
+│   │   └── theme.js               # Shared color tokens and labelStyle
+│   └── components/
+│       ├── Navbar.jsx             # Top bar: branding, unit subtitle, progress badge
+│       ├── ChatPanel.jsx          # AI tutor panel: message list, typing indicator, input bar
+│       ├── ProgressStrip.jsx      # Unit pill buttons and completion counter
+│       ├── LessonPanel.jsx        # Lesson reference card — height driven by parent drag state
+│       ├── QuestionPanel.jsx      # Question prompt, compact code editor, feedback, buttons
+│       └── UnitComplete.jsx       # Completion screen with Start Over button
+└── admin/
+    └── index.jsx                  # Placeholder — wired into App.jsx when ready
+```
+
+### Resizable layout
+
+The student view has two drag handles:
+
+* **Vertical divider** between the AI tutor (left) and content columns (right) — drag left/right to widen or narrow the chat panel (clamped 20–65 % of viewport width).
+* **Horizontal divider** between the lesson reference card and the question/answer area — drag up/down to give the lesson more or less space (clamped 120–420 px).
 
 ---
 
