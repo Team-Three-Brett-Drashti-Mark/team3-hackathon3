@@ -3,5 +3,6 @@ groq
 python-dotenv
 fastapi
 uvicorn
+python-multipart
 databricks-sdk
 databricks-vectorsearch
