@@ -1,15 +1,5 @@
 # Databricks notebook source
 # Install required packages
-
-%pip install -U \
-  databricks-langchain==0.16.1 \
-  langchain==1.2.10 \
-  langchain-core==1.2.16 \
-  langchain-text-splitters==1.1.1 \
-  langchain-community==0.4.1 \
-  langchain-experimental==0.4.1 \
-  nltk==3.9.3 \
-  pypdf==5.1.0
   
 try:
     dbutils.library.restartPython()
