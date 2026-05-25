@@ -28,6 +28,23 @@ VOLUME_ROOT = "/Volumes/capstone/bronze_layer/curriculum_raw"
 # Every new week gets these three subfolders created automatically.
 WEEK_SUBFOLDERS = ["markdown", "pdfs", "quizzes"]
 
+# Per-folder allowlist for upload validation. Each folder is bound to a single
+# content kind, and the downstream silver chunker keys off both the folder
+# segment (via _parse_volume_path → content_type) AND the file extension when
+# reading the file contents. Letting a .pdf land in markdown/ would silently
+# break the chunker (it tries to open and string-decode the bytes), so the
+# guard runs at the upload boundary rather than discovering the mismatch in
+# the ETL job an hour later.
+#
+# We accept both .md and .markdown for the markdown folder because both are
+# in common use and the chunker is extension-agnostic once the file is opened.
+# Quizzes are JSON-only — the chunker parses them with json.loads().
+FOLDER_ALLOWED_EXTENSIONS: dict[str, set[str]] = {
+    "markdown": {".md", ".markdown"},
+    "pdfs":     {".pdf"},
+    "quizzes":  {".json"},
+}
+
 # Silver / vector / semantic layer object names — referenced by the cascade
 # delete flow when a file is removed from the bronze volume. Keeping these as
 # module-level constants (not inlined into the SQL strings) makes it easy to
@@ -453,6 +470,24 @@ async def upload_file(week: str, folder: str, file: UploadFile = File(...)):
     """
     Upload a file into the specified week/folder in the curriculum volume.
 
+    Two-stage validation before we touch the volume:
+
+      1. Folder must be one of the three known subfolders. The route already
+         pins this in the URL, but we still check explicitly so a typo'd path
+         in a curl test produces a clean 400 instead of an internal error
+         later in the chunker.
+
+      2. File extension must match the folder's allowlist
+         (see FOLDER_ALLOWED_EXTENSIONS). PDFs cannot land in markdown/, JSON
+         quizzes cannot land in pdfs/, etc. This guard exists for two reasons:
+           - The silver chunker dispatches on the folder name AND opens the
+             file with assumptions about its format. A misrouted file would
+             not error at upload time but would crash (or silently produce
+             garbage chunks) during the ETL run.
+           - The file-arrival-triggered job watches the entire bronze volume,
+             so a mistake here doesn't fail loudly — it pollutes silver until
+             someone notices and runs reconciliation.
+
     Uses overwrite=True so re-uploading a corrected version of an existing
     file replaces it rather than erroring. The filename is taken from the
     original file — no server-side renaming is applied.
@@ -462,8 +497,28 @@ async def upload_file(week: str, folder: str, file: UploadFile = File(...)):
     if folder not in WEEK_SUBFOLDERS:
         raise HTTPException(status_code=400, detail=f"folder must be one of {WEEK_SUBFOLDERS}")
 
+    # Extension check is case-insensitive ("Notes.MD" is still markdown).
+    # os.path.splitext returns ("Notes", ".MD"); .lower() normalizes for the
+    # set membership check against the allowlist.
+    filename = file.filename or ""
+    _stem, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    allowed = FOLDER_ALLOWED_EXTENSIONS[folder]
+    if ext not in allowed:
+        # Sorted for stable error messages — useful both for tests and for
+        # admins reading the toast in the UI.
+        allowed_str = ", ".join(sorted(allowed))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"File '{filename}' has extension '{ext or '(none)'}', "
+                f"which is not allowed in {folder}/. "
+                f"Allowed extensions for this folder: {allowed_str}."
+            ),
+        )
+
     content = await file.read()
-    path = f"{VOLUME_ROOT}/{week}/{folder}/{file.filename}"
+    path = f"{VOLUME_ROOT}/{week}/{folder}/{filename}"
 
     client = _client()
     try:
@@ -471,7 +526,12 @@ async def upload_file(week: str, folder: str, file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {"uploaded": file.filename, "path": path}
+    # The file-arrival-triggered ETL job picks up the new file ~30s after
+    # upload (file_arrival.wait_after_last_change_seconds) and runs silver
+    # chunking + vector sync. Status of that run is visible in the Databricks
+    # Jobs UI; we don't surface it here to keep the upload response shape
+    # stable and the UI flow simple.
+    return {"uploaded": filename, "path": path}
 
 
 class DeleteFileRequest(BaseModel):

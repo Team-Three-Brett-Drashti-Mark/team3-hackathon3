@@ -1,0 +1,44 @@
+# =============================================================================
+# Pathwise / team3-hackathon3 — Databricks Asset Bundle
+# =============================================================================
+# Defines the deployable resources we want to live in this workspace:
+# right now that's the curriculum ETL Job (see resources/curriculum_etl.yml)
+# triggered when files arrive in the bronze volume.
+#
+# Documentation: https://docs.databricks.com/dev-tools/bundles/index.html
+#
+# Validate before deploying:
+#     databricks bundle validate
+#
+# Deploy:
+#     databricks bundle deploy        # uses the default target (dev)
+#     databricks bundle deploy -t dev # explicit
+# =============================================================================
+
+bundle:
+  name: team3-hackathon3
+
+# Pull in every YAML under resources/. Keeping resources in their own files
+# (one per "thing") keeps this root config small and stops merge conflicts
+# when two contributors add unrelated resources at the same time.
+include:
+  - resources/*.yml
+
+targets:
+  # `dev` is the personal-workspace target every contributor deploys to from
+  # their laptop. `mode: development` causes the CLI to prefix resource names
+  # with the user (e.g. "[dev brett] Curriculum ETL"), so multiple devs can
+  # deploy side-by-side without colliding.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-05589632-7e63.cloud.databricks.com
+
+  # Production target stub. Switch the host (and ideally use a service
+  # principal profile here) when we're ready for a real prod deploy.
+  #
+  # prod:
+  #   mode: production
+  #   workspace:
+  #     host: https://dbc-05589632-7e63.cloud.databricks.com
