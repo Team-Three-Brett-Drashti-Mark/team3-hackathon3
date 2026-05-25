@@ -9,3 +9,11 @@ command:
       npm run build
       cd ..
       uvicorn app.api:app --host 0.0.0.0 --port 8000
+
+env:
+  - name: GROQ_API_KEY
+    valueFrom: resource:GROQ_API_KEY
+  - name: DATABRICKS_HOST
+    valueFrom: resource:DATABRICKS_HOST
+  - name: DATABRICKS_TOKEN
+    valueFrom: resource:DATABRICKS_TOKEN
