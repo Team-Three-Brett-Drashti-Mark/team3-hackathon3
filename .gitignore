@@ -243,4 +243,5 @@ cython_debug/
 .github
 typings/
 .mcp.json
-databricks.yml
+# databricks.yml is intentionally tracked — it defines the curriculum ETL
+# Asset Bundle (job + file-arrival trigger). See resources/curriculum_etl.yml.
