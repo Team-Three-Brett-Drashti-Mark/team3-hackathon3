@@ -1,5 +1,7 @@
 import io
+import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -9,6 +11,8 @@ from pydantic import BaseModel
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementResponse, StatementState
+
+logger = logging.getLogger(__name__)
 
 # States that mean a SQL statement has finished (success or otherwise).
 # Used to decide when to stop polling.
@@ -24,6 +28,22 @@ VOLUME_ROOT = "/Volumes/capstone/bronze_layer/curriculum_raw"
 # Every new week gets these three subfolders created automatically.
 WEEK_SUBFOLDERS = ["markdown", "pdfs", "quizzes"]
 
+# Silver / vector / semantic layer object names — referenced by the cascade
+# delete flow when a file is removed from the bronze volume. Keeping these as
+# module-level constants (not inlined into the SQL strings) makes it easy to
+# point a non-prod deployment at a different catalog/schema later by patching
+# this single block, and lets the test suite assert against well-known names.
+#
+# Layer ownership:
+#   SILVER_TABLE     — chunked + metadata-enriched rows from the chunking notebook
+#   VECTOR_TABLE     — Delta source table for the vector search index (CDC on)
+#   VECTOR_ENDPOINT  — the Vector Search compute endpoint serving the index
+#   VECTOR_INDEX     — the Delta Sync index (TRIGGERED pipeline; needs .sync())
+SILVER_TABLE    = "capstone.silver_layer.curriculum_chunks"
+VECTOR_TABLE    = "capstone.vector_layer.capstone_vector_store"
+VECTOR_ENDPOINT = "capstone_vector_endpoint"
+VECTOR_INDEX    = "capstone.vector_layer.curriculum_semantic_index"
+
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
@@ -38,6 +58,10 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 _ws_client: WorkspaceClient | None = None
 _warehouse_id: str | None = None
+# VectorSearchClient — typed as Any because importing the type at module load
+# would defeat the lazy-import savings below. Materialized on first call to
+# _vector_client() and reused for the process lifetime.
+_vs_client = None
 
 
 def _client() -> WorkspaceClient:
@@ -49,6 +73,42 @@ def _client() -> WorkspaceClient:
             token=os.environ["DATABRICKS_TOKEN"],
         )
     return _ws_client
+
+
+def _vector_client():
+    """
+    Return the process-level VectorSearchClient, creating it on first call.
+
+    The vectorsearch SDK is imported lazily because:
+      1. It pulls in heavy transitive deps (mlflow, grpc, etc.) — importing it
+         eagerly at module load slows down every endpoint, even the ones that
+         never touch vector search.
+      2. Only the cascade delete and (potentially) future endpoints need it,
+         so most admin-page requests never pay this cost.
+
+    `disable_notice=True` suppresses the SDK's "Hello! Welcome to Vector Search"
+    banner that otherwise prints to stdout on every client instantiation —
+    useful for local debugging but noise in server logs.
+    """
+    global _vs_client
+    if _vs_client is None:
+        from databricks.vector_search.client import VectorSearchClient
+        _vs_client = VectorSearchClient(disable_notice=True)
+    return _vs_client
+
+
+def _sql_escape(value: str) -> str:
+    """
+    Escape single quotes for safe inclusion in a SQL string literal.
+
+    The Databricks statement execution API supports parameterized queries, but
+    the existing _execute() helper doesn't thread parameters through yet, and
+    every other call site in this file builds SQL by f-string interpolation.
+    Until that helper is upgraded, this one-liner is the local guard against
+    apostrophes in filenames (e.g. ``o'reilly_notes.md``) breaking the query
+    or — worse — being interpreted as injection.
+    """
+    return value.replace("'", "''")
 
 
 def _get_warehouse_id() -> str:
@@ -418,28 +478,259 @@ class DeleteFileRequest(BaseModel):
     path: str
 
 
+def _parse_volume_path(path: str) -> tuple[str, str, str]:
+    """
+    Split a bronze volume path into (week, folder, filename).
+
+    Example:
+        /Volumes/capstone/bronze_layer/curriculum_raw/week_01/markdown/intro.md
+        -> ("week_01", "markdown", "intro.md")
+
+    Falls back to empty strings for any segment we can't identify so the caller
+    can decide whether the fallback path is usable. Specifically, the vector
+    cleanup fallback in delete_file() needs BOTH `week` and `filename` to
+    disambiguate (two weeks can both contain a file named `intro.md`); when
+    either is empty, the fallback is skipped rather than over-deleting.
+
+    Note: we intentionally do not use pathlib.Path here because the volume
+    path is a stable, forward-slash UC path — not the local filesystem — and
+    Path() would normalize/lose information on Windows runtimes.
+    """
+    # Strip the well-known volume root prefix so the remaining parts are
+    # exactly [week, folder, filename] in the standard curriculum layout.
+    rel = path[len(VOLUME_ROOT):].lstrip("/")
+    parts = rel.split("/")
+    week     = parts[0]  if len(parts) > 0 else ""
+    folder   = parts[1]  if len(parts) > 1 else ""
+    filename = parts[-1] if parts            else ""
+    return week, folder, filename
+
+
+def _trigger_index_sync() -> bool:
+    """
+    Fire the vector index sync in a background thread (fire-and-forget).
+
+    Why this isn't inline in the request handler:
+      - The vector search index is configured as a TRIGGERED Delta Sync index
+        (see "Capstone to Vector DB Sync.ipynb"). It doesn't auto-pull CDC
+        changes from the source Delta table — we have to call .sync() to kick
+        an incremental update.
+      - Sync latency for a small change is typically 20-60s, occasionally
+        longer if the index is warming up. Blocking the HTTP response on it
+        would mean the admin UI sits on a spinner for a minute every delete,
+        even though the bronze file is already gone and the silver/vector
+        deltas are already committed.
+      - From the user's perspective, the file disappears from the file list
+        the moment this function returns. The retrieval layer might briefly
+        still surface the deleted chunks (worst case: until the next sync
+        completes), which is acceptable for this hackathon and can be tightened
+        later with a wait-for-sync flag if needed.
+
+    Failures inside the background thread are logged but don't surface to the
+    user — the silver/vector tables are already cleaned, so the deleted chunks
+    won't come back. A failed sync just means the embedded copies stick around
+    until the next successful sync (or the next manual trigger).
+
+    Returns True if the background thread was successfully dispatched, False
+    if we couldn't even start the thread (extremely rare — would indicate an
+    OS resource exhaustion).
+    """
+    def _run():
+        # This runs off the request thread, so any exception here must NOT be
+        # allowed to propagate (it would crash silently in a background worker
+        # and leave no trace beyond stderr). Log + swallow.
+        try:
+            index = _vector_client().get_index(
+                endpoint_name=VECTOR_ENDPOINT,
+                index_name=VECTOR_INDEX,
+            )
+            index.sync()
+        except Exception as exc:
+            logger.warning("Vector index sync failed: %s", exc)
+
+    try:
+        # daemon=True so the thread doesn't keep the process alive at shutdown.
+        # A delete cascade is recoverable on the next sync, so we'd rather drop
+        # an in-flight sync than block process exit.
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+    except Exception as exc:
+        logger.warning("Could not dispatch vector index sync: %s", exc)
+        return False
+
+
 @router.delete("/curriculum/file")
 def delete_file(body: DeleteFileRequest):
     """
-    Delete a single file from the curriculum volume.
+    Cascade-delete a curriculum file across all four data layers.
 
-    The path is validated against VOLUME_ROOT before deletion to prevent
-    an admin from accidentally (or maliciously) deleting files outside the
-    curriculum volume.
+    Layer order and the reasoning behind each step:
 
-    Returns: { deleted: str }
+      1. Silver lookup — fetch the chunk_ids that belong to this file BEFORE
+                         touching anything. If the silver DELETE in step 3
+                         raced with another writer (e.g. a re-ingest job),
+                         we'd lose the ids needed to drive the vector
+                         cleanup in step 4. Looking up first decouples the
+                         vector cleanup from the silver delete order.
+      2. Bronze       — remove the raw file from the UC volume. Doing this
+                         second (not first) means a SQL warehouse outage
+                         won't leave the bronze gone but silver/vector
+                         intact. The UI's "deleting" toast already shows
+                         intent, and re-clicking remove on an in-flight or
+                         partially-failed delete is idempotent (see the
+                         NOT_FOUND handling below).
+      3. Silver       — DELETE rows by source_path. Using full path (not
+                         filename) handles the case where two weeks both
+                         contain a file with the same name.
+      4. Vector store — DELETE rows from the vector source Delta table by
+                         id IN (...). Falls back to a JSON metadata match
+                         on (source_file, week) if silver returned no
+                         chunk_ids — covers the edge case where silver was
+                         rebuilt or never populated, but the vector table
+                         still holds the orphaned chunks.
+      5. Semantic     — Fire .sync() on the TRIGGERED Delta Sync index in a
+                         background thread. CDC on the vector source table
+                         drives the actual delete on the embedded copy.
+
+    Idempotency: re-clicking remove on a file that's already partially gone
+    is safe. NOT_FOUND on bronze is treated as success; silver/vector DELETEs
+    on already-empty result sets are no-ops at the SQL level.
+
+    Security: the path is validated against VOLUME_ROOT to prevent the
+    endpoint from being weaponized to delete files elsewhere in UC. The SQL
+    interpolation is hardened with _sql_escape() against apostrophe-containing
+    filenames (see the helper's docstring for why we're not parameterizing yet).
+
+    Returns:
+        {
+          deleted: str,               # echo of the input path
+          silver_rows: int,           # how many chunk rows were on this file
+          vector_rows: int,           # how many vector_store rows were deleted
+                                      # (0 if the fallback path ran — see below)
+          index_sync_triggered: bool, # whether the background sync dispatched
+        }
     """
-    # Reject any path that escapes the curriculum volume root.
+    # ── Guard rail: never let this endpoint touch paths outside the curriculum
+    # volume. The bronze workspace contains other UC objects (logging tables,
+    # checkpoints, etc.) that an admin should NOT be able to nuke via a curl
+    # against this endpoint.
     if not body.path.startswith(VOLUME_ROOT):
         raise HTTPException(status_code=400, detail="Path is outside the curriculum volume")
 
+    # Bind locals up-front so every step below has consistent inputs and the
+    # SQL-safe literal isn't recomputed each time.
+    path     = body.path
+    path_lit = _sql_escape(path)
+    week, _folder, filename = _parse_volume_path(path)
+
+    # ── Step 1: collect chunk_ids from silver before deleting anything ────────
+    # The vector_store rows are keyed by chunk_id (= silver's chunk_id), so we
+    # need this list to drive the vector DELETE in step 4. Two reasons we do
+    # the SELECT before the DELETE rather than relying on a single statement:
+    #   - The Databricks SQL DELETE doesn't return the affected row keys, only
+    #     a count. We need the actual ids.
+    #   - Capturing the ids first means a concurrent re-ingest writer can't
+    #     race us into a state where silver is half-empty by the time we read.
+    # A SELECT failure here is recoverable: we fall back to the filename+week
+    # JSON match in step 4, so silver being temporarily unreachable doesn't
+    # block the rest of the cascade.
+    try:
+        chunk_rows = _run_sql(
+            f"SELECT chunk_id FROM {SILVER_TABLE} WHERE source_path = '{path_lit}'"
+        )
+    except HTTPException:
+        chunk_rows = []
+    chunk_ids = [r[0] for r in chunk_rows if r and r[0]]
+
+    # ── Step 2: delete bronze file ───────────────────────────────────────────
+    # This is the only step the user-facing UI directly observes (the file
+    # row vanishes from the listing). A failure here aborts the cascade so we
+    # don't leave silver/vector half-cleaned for a file the admin can still
+    # see — they'd have no UI affordance to retry against the missing bronze.
+    #
+    # NOT_FOUND is the deliberate exception: re-clicking "remove" on a file
+    # whose bronze copy is already gone (e.g. a previous cascade succeeded on
+    # bronze/silver but failed on vector) should still finish cleaning up the
+    # downstream layers.
     client = _client()
     try:
-        client.files.delete(body.path)
+        client.files.delete(path)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        msg = str(exc).lower()
+        # The SDK doesn't expose a typed NOT_FOUND exception, so we sniff the
+        # message. Three known surfaces: REST 404, "FILE_NOT_FOUND" error code,
+        # "not found" phrasing. Match all three to be defensive.
+        if "not_found" not in msg and "not found" not in msg and "404" not in msg:
+            raise HTTPException(status_code=500, detail=f"Bronze delete failed: {exc}")
 
-    return {"deleted": body.path}
+    # ── Step 3: delete silver rows ───────────────────────────────────────────
+    # We already know the row count from step 1, so we can report silver_rows
+    # without doing a follow-up COUNT(*). A DELETE failure here is the worst
+    # cascade state to be in: bronze is gone but silver still holds chunks
+    # that reference a missing source file. We surface that explicitly in the
+    # error detail so the admin knows reconciliation is needed.
+    silver_rows = 0
+    try:
+        _execute(f"DELETE FROM {SILVER_TABLE} WHERE source_path = '{path_lit}'")
+        silver_rows = len(chunk_ids)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Bronze deleted but silver cleanup failed: {exc.detail}",
+        )
+
+    # ── Step 4: delete vector store rows ─────────────────────────────────────
+    # Two paths:
+    #   - Primary: we have chunk_ids from silver, so we can do a precise
+    #     `id IN (...)` delete. This is the common case and lets us report
+    #     an accurate vector_rows count.
+    #   - Fallback: silver returned nothing (either step 1 errored, or the
+    #     silver table has no rows for this path even though the vector
+    #     table does — a real possibility if silver was rebuilt without
+    #     re-running the vector sync notebook). We match on the JSON
+    #     metadata fields the sync notebook packs into each vector row.
+    #     vector_rows stays 0 because we'd need a separate SELECT to know
+    #     how many were actually affected — the index sync in step 5 will
+    #     reconcile regardless.
+    vector_rows = 0
+    try:
+        if chunk_ids:
+            # Quote each id individually so the IN-list is bulletproof against
+            # any id containing characters that happen to confuse SQL parsing.
+            id_list = ", ".join(f"'{_sql_escape(cid)}'" for cid in chunk_ids)
+            _execute(f"DELETE FROM {VECTOR_TABLE} WHERE id IN ({id_list})")
+            vector_rows = len(chunk_ids)
+        elif filename and week:
+            # Fallback only fires when we have BOTH filename and week — that's
+            # the minimum signal needed to disambiguate "intro.md in week_01"
+            # from "intro.md in week_02" without over-deleting.
+            fname_lit = _sql_escape(filename)
+            week_lit  = _sql_escape(week)
+            _execute(
+                f"DELETE FROM {VECTOR_TABLE} "
+                f"WHERE get_json_object(metadata, '$.source_file') = '{fname_lit}' "
+                f"  AND get_json_object(metadata, '$.week') = '{week_lit}'"
+            )
+    except HTTPException as exc:
+        # By this point bronze + silver are already clean. A vector failure
+        # leaves orphaned embeddings that the index sync will keep serving
+        # until manually reconciled, so surface explicitly.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Bronze + silver cleared but vector cleanup failed: {exc.detail}",
+        )
+
+    # ── Step 5: trigger the semantic index sync (fire-and-forget) ────────────
+    # See _trigger_index_sync() for why this runs off-thread and why a failure
+    # here is intentionally non-fatal.
+    index_sync_triggered = _trigger_index_sync()
+
+    return {
+        "deleted": path,
+        "silver_rows": silver_rows,
+        "vector_rows": vector_rows,
+        "index_sync_triggered": index_sync_triggered,
+    }
 
 
 # ── Audit Log ─────────────────────────────────────────────────────────────────
