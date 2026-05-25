@@ -42,13 +42,36 @@ export async function uploadFile(week, folder, file) {
   return res.json();
 }
 
+// Triggers the cascade delete: bronze volume → silver chunks → vector store →
+// semantic index sync. The backend can take 30-60s on a cold SQL warehouse
+// (see app/admin.py:_poll), so callers should show an in-flight indicator
+// rather than assuming this resolves quickly.
+//
+// On failure, the backend returns a FastAPI {detail: "..."} payload describing
+// WHICH step failed (e.g. "Bronze deleted but silver cleanup failed: ..."),
+// which is much more actionable than a bare status code. We propagate that
+// detail string through Error.message so the UI can render it verbatim.
 export async function deleteFile(path) {
   const res = await fetch(`${base()}/admin/curriculum/file`, {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path }),
   });
-  if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
+  if (!res.ok) {
+    // Default to the status-code message so we always throw something useful,
+    // then upgrade to the server's `detail` field if present.
+    let detail = `Delete failed: ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      // Response wasn't JSON (e.g. an upstream proxy 502 page) — fall back to
+      // the status-code message we already set.
+    }
+    throw new Error(detail);
+  }
+  // Response shape: { deleted, silver_rows, vector_rows, index_sync_triggered }
+  // The hook uses silver_rows to render "N chunks deleted" in the success toast.
   return res.json();
 }
 
