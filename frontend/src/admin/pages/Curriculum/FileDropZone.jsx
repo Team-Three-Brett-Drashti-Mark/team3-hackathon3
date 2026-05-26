@@ -76,7 +76,7 @@ export default function FileDropZone({ onUpload, uploading, etlRunning }) {
             <p style={{ margin: 0, fontSize: 13, color: colors.muted }}>
               or{" "}
               <span style={{ textDecoration: "underline", color: colors.text }}>browse</span>
-              {" "}· we'll re-index in ~30 seconds, no engineering ticket
+              {" "}· We'll re-index this shortly — no engineering ticket needed.
             </p>
           </>
         )}
