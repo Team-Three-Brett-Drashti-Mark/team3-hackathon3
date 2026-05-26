@@ -14,10 +14,12 @@ Pathwise now supports two ways of running:
 * Local development mode for iteration on a laptop or workstation.
 * Hosted Databricks Apps deployment for a single hosted web app inside Databricks.
 
-In local development, the project still runs as two processes:
+In local development, the project runs as two processes:
 
 * FastAPI backend on `http://localhost:8000`
 * Vite frontend on `http://localhost:5173`
+
+The Vite dev server proxies all `/admin`, `/chat`, and `/quiz` requests to the backend automatically, so no separate API base URL configuration is needed during development.
 
 In the hosted Databricks App, the architecture is different:
 
@@ -181,7 +183,7 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 The script starts both services, waits for the backend health check, and shuts both down cleanly on `Ctrl+C`.
 
-Open `http://localhost:5173` in your browser to use the local development UI.
+Open `http://localhost:5173` in your browser for the student view, or `http://localhost:5173/#/admin` for the admin dashboard.
 
 ---
 
@@ -259,24 +261,107 @@ ATTEMPT: ...
 ```text
 team3-hackathon3/
 ├── app/
-│   ├── api.py          # FastAPI app — /chat endpoint, hosted static serving, SPA fallback
-│   ├── logger.py       # Interaction logger with Delta write + stdout/app.log fallback
-│   └── main.py         # LangGraph graph and runtime env loading logic
+│   ├── api.py               # FastAPI app — /chat, /admin/* endpoints, hosted static serving
+│   ├── admin.py             # Admin API router — metrics, curriculum volume, audit log
+│   ├── logger.py            # Interaction logger with Delta write + stdout/app.log fallback
+│   └── main.py              # LangGraph graph and runtime env loading logic
 ├── frontend/
 │   ├── src/
-│   │   └── App.jsx     # React chat UI — uses relative /chat in hosted mode
-│   └── dist/           # Production build output served by FastAPI in Databricks Apps
+│   │   ├── App.jsx          # Root hash router — #/admin → AdminApp, default → StudentApp
+│   │   ├── student/         # All student-facing UI (see Frontend Architecture below)
+│   │   └── admin/           # Admin dashboard (see Frontend Architecture below)
+│   ├── vite.config.js       # Dev server proxy — /admin, /chat, /quiz → localhost:8000
+│   └── dist/                # Production build output served by FastAPI in Databricks Apps
 ├── guardrails/
 │   └── no_direct_answers.py
 ├── retrieval/
-│   └── retriever.py    # Databricks Vector Search client — returns chunks with metadata
-├── start.sh            # One-command local startup (Mac / Linux)
-├── start.ps1           # One-command local startup (Windows PowerShell)
-├── app.yaml            # Databricks Apps build/run manifest used from the repo root
-├── databricks.yml      # Declarative Automation Bundles config for workspace development
-├── requirements.txt    # Python backend dependencies
-└── .env                # Local secrets for development only — never commit this file
+│   └── retriever.py         # Databricks Vector Search client — returns chunks with metadata
+├── start.sh                 # One-command local startup (Mac / Linux)
+├── start.ps1                # One-command local startup (Windows PowerShell)
+├── app.yaml                 # Databricks Apps build/run manifest used from the repo root
+├── databricks.yml           # Declarative Automation Bundles config for workspace development
+├── requirements.txt         # Python backend dependencies
+└── .env                     # Local secrets for development only — never commit this file
 ```
+
+---
+
+## Frontend Architecture
+
+`App.jsx` at the root is a thin hash-based router: visiting `/#/admin` renders the admin dashboard, everything else renders the student view.
+
+```text
+frontend/src/
+├── App.jsx                        # Root router — hash #/admin → AdminApp, default → StudentApp
+├── App.css                        # Global styles (e.g. .thinking animation)
+├── student/
+│   ├── index.jsx                  # Student view root — layout, drag handles, transition handlers
+│   ├── data/
+│   │   └── lessonContent.js       # Lesson text, unit subtitle, and question definitions
+│   ├── services/
+│   │   └── chatApi.js             # Fetch call to /chat — plain async function, no React
+│   ├── hooks/
+│   │   ├── useQuiz.js             # Answer validation, progress, and question-navigation state
+│   │   └── useChat.js             # Chat history, session ID, loading state, and scroll effect
+│   ├── styles/
+│   │   └── theme.js               # Shared color tokens and labelStyle used by both views
+│   └── components/
+│       ├── Navbar.jsx             # Top bar: branding, unit subtitle, progress badge
+│       ├── ChatPanel.jsx          # AI tutor panel: message list, typing indicator, input bar
+│       ├── ProgressStrip.jsx      # Unit pill buttons and completion counter
+│       ├── LessonPanel.jsx        # Lesson reference card — height driven by parent drag state
+│       ├── QuestionPanel.jsx      # Question prompt, compact code editor, feedback, buttons
+│       └── UnitComplete.jsx       # Completion screen with Start Over button
+└── admin/
+    ├── index.jsx                  # Admin root — sidebar nav + content area
+    ├── components/
+    │   └── Sidebar.jsx            # Left nav: Overview, Curriculum, Audit Log, Ask
+    ├── hooks/
+    │   ├── useOverviewMetrics.js  # Fetches /admin/metrics/overview
+    │   ├── useCurriculum.js       # Curriculum volume state machine (weeks → folders → files)
+    │   └── useAuditLog.js         # Paginated audit log fetch with intent filter
+    ├── services/
+    │   └── adminApi.js            # All /admin/* fetch calls — plain async functions, no React
+    └── pages/
+        ├── Overview/
+        │   ├── index.jsx              # Stat cards + daily / hourly / intent charts
+        │   ├── StatCard.jsx           # Single metric tile with optional highlight
+        │   ├── DailyUsageChart.jsx    # Inline SVG bar chart (questions per day, M/D labels)
+        │   ├── HourlyActivityChart.jsx# Inline SVG bar chart (activity by hour 0–23)
+        │   └── IntentBreakdownChart.jsx # Horizontal CSS bars (curriculum / answer_seeking / off_topic)
+        ├── Curriculum/
+        │   ├── index.jsx              # Week list → folder list → file list drill-down
+        │   └── FileDropZone.jsx       # HTML5 drag-and-drop + click-to-browse uploader
+        ├── AuditLog/
+        │   ├── index.jsx              # Paginated table with intent filter
+        │   └── LogRow.jsx             # Expandable row showing full student + Pathwise message pair
+        └── Ask/
+            └── index.jsx              # Placeholder
+```
+
+### Admin dashboard
+
+Navigate to `http://localhost:5173/#/admin` to open the admin dashboard. It requires the backend to be running (the Vite proxy forwards all `/admin/*` requests to port 8000).
+
+| Page | What it shows |
+|---|---|
+| **Overview** | Daily question counts, hourly activity heatmap, intent breakdown (curriculum / answer-seeking / off-topic), and a count of sessions that hit the hard block |
+| **Curriculum** | Browse the Bronze-layer volume (`/Volumes/capstone/bronze_layer/curriculum_raw`), drill into week → folder → files, upload files via drag-and-drop, create new week folders |
+| **Audit Log** | Paginated, filterable table of every interaction from `capstone.logging.interaction_logs` — click a row to expand the full student message and Pathwise reply |
+| **Ask** | Placeholder — reserved for future admin query interface |
+
+Metrics are sourced from three pre-built Databricks views in `capstone.logging`:
+
+* `v_daily_usage` — interactions per day
+* `v_hourly_activity` — interactions by hour of day
+* `v_intent_breakdown` — counts per intent label
+
+### Resizable student layout
+
+The student view has two drag handles:
+
+* **Vertical divider** between the AI tutor (left) and content columns (right) — drag left/right to widen or narrow the chat panel (clamped 20–65 % of viewport width).
+* **Horizontal divider** between the lesson reference card and the question/answer area — drag up/down to give the lesson more or less space (clamped 120–420 px).
 
 ---
 
@@ -296,14 +381,15 @@ team3-hackathon3/
 * Student learning assistant (Chat UI + RAG retrieval with multi-turn context)
 * Guardrail logic (curriculum / attempt-1 / attempt-2 / hard-block escalation)
 * Answer-leak detection with static fallbacks
-* Interaction logging
+* Interaction logging to `capstone.logging.interaction_logs`
 * Databricks Apps hosting support
+* Admin dashboard — usage metrics, curriculum volume management, audit log
 
 ### Phase 2: Scaled Product Version
 * Improved intelligence layer (hybrid search, personalized hint progression)
-* Advanced dashboard (at-risk indicators, struggle heatmaps)
-* Admin controls (instant curriculum updates)
-* Instructor layer (common misconceptions report)
+* Advanced dashboard (at-risk indicators, struggle heatmaps, per-student drill-down)
+* Instructor layer (common misconceptions report, question pattern analysis)
+* Admin Ask interface (natural-language queries over the logging data)
 * Better product experience (UI/UX polish, mobile responsiveness)
 
 # Pathwise — Test Suite

@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.admin import router as admin_router
 from app.logger import log_interaction
 from app.main import PathwiseState, build_graph
 
@@ -23,6 +24,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(admin_router)
 
 # Build the graph once at startup — shared across all requests
 graph = build_graph()
