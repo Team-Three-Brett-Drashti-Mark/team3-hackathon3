@@ -1,11 +1,19 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
   fetchWeeks,
   createWeek as apiCreateWeek,
   fetchFolderFiles,
   uploadFile as apiUpload,
   deleteFile as apiDelete,
+  fetchEtlRun as apiFetchEtlRun,
 } from "../services/adminApi";
+
+// How often the hook polls the backend for ETL run status. 3 seconds is a
+// trade-off: low enough that the toast feels live (most ETL runs finish in
+// 30-90s, so the admin sees 10-30 updates), high enough that we don't
+// hammer the Databricks Jobs API. Pulled out here so a future debug build
+// can tune it without searching the file.
+const ETL_POLL_INTERVAL_MS = 3000;
 
 // Manages the three-level drill-down: weeks → folders → files.
 // view: 'weeks' | 'folders' | 'files'
@@ -36,6 +44,38 @@ export function useCurriculum() {
     path: null,
     message: "",
   });
+
+  // Tracks the ETL job run kicked off by the backend after a successful
+  // upload (see app/admin.py:upload_file). Lifecycle:
+  //
+  //   idle → running → (success | failed | error) → idle
+  //
+  //   phase:      coarse state for the toast. "running" while the job is
+  //               doing its thing; "success"/"failed" mirror the
+  //               Databricks result_state on terminal; "error" means we
+  //               couldn't even poll (network, 404, etc).
+  //   runId:      Databricks run_id, kept so the polling effect knows
+  //               which run to query.
+  //   runPageUrl: deep link into the Jobs UI for the toast's "view run"
+  //               affordance.
+  //   message:    pre-formatted human-readable status.
+  //
+  // The drop zone uses `phase === "running"` to disable itself so an
+  // admin can't queue a second upload while the first one's ETL is still
+  // in flight — that would race two MERGEs against the silver table and
+  // typically cost more time than just waiting.
+  const [etlStatus, setEtlStatus] = useState({
+    phase: "idle", // "idle" | "running" | "success" | "failed" | "error"
+    runId: null,
+    runPageUrl: null,
+    message: "",
+  });
+
+  // Reference to the active poll timer so the polling effect can cancel
+  // any in-flight schedule when the run terminates or the component
+  // unmounts. We use a ref (not state) because mutating it should NOT
+  // trigger a re-render — and the timer ID is internal plumbing, not UI.
+  const etlPollTimerRef = useRef(null);
 
   const loadWeeks = useCallback(async () => {
     setLoading(true);
@@ -97,18 +137,118 @@ export function useCurriculum() {
     }
   }, [loadWeeks]);
 
+  // ── ETL run status polling ───────────────────────────────────────────
+  //
+  // Single recursive timer loop rather than setInterval: each tick
+  // schedules the next only after the previous fetch resolves. This
+  // avoids piling up overlapping requests if the backend hiccups and a
+  // single poll takes >ETL_POLL_INTERVAL_MS, and it makes "stop when
+  // terminal" a single `return` instead of clearInterval bookkeeping.
+  //
+  // The terminal-state mapping lives here (not in the toast component)
+  // so any future consumer reading etlStatus sees a clean
+  // success/failed/error phase instead of having to interpret raw
+  // Databricks result_state values.
+  const pollEtlRunOnce = useCallback(async (runId, runPageUrl) => {
+    try {
+      const r = await apiFetchEtlRun(runId);
+      if (!r.is_terminal) {
+        setEtlStatus({
+          phase: "running",
+          runId,
+          runPageUrl: r.run_page_url || runPageUrl,
+          message: r.state_message
+            ? `ETL pipeline running — ${r.state_message}`
+            : "ETL pipeline running — chunking and embedding new content…",
+        });
+        etlPollTimerRef.current = setTimeout(
+          () => pollEtlRunOnce(runId, runPageUrl),
+          ETL_POLL_INTERVAL_MS,
+        );
+        return;
+      }
+      // Terminal: translate Databricks result_state into our phase.
+      // SUCCESS → success; everything else (FAILED, TIMEDOUT, CANCELED,
+      // INTERNAL_ERROR) → failed. SKIPPED life-cycle without a
+      // result_state is also treated as failed so the toast surfaces it.
+      const succeeded = r.result_state === "SUCCESS";
+      setEtlStatus({
+        phase: succeeded ? "success" : "failed",
+        runId,
+        runPageUrl: r.run_page_url || runPageUrl,
+        message: succeeded
+          ? "ETL complete — new content indexed and ready to search."
+          : `ETL failed${r.result_state ? ` (${r.result_state})` : ""}${
+              r.state_message ? `: ${r.state_message}` : ""
+            }.`,
+      });
+    } catch (e) {
+      // Polling itself errored — usually a 404 (run deleted) or network
+      // blip. Surface as "error" so the toast can show a dismissable
+      // message instead of spinning forever.
+      setEtlStatus({
+        phase: "error",
+        runId,
+        runPageUrl,
+        message: `Couldn't read ETL status: ${e.message}`,
+      });
+    }
+  }, []);
+
   const uploadFile = useCallback(async (file) => {
     setError(null);
     try {
-      await apiUpload(selectedWeek, selectedFolder, file);
-      // Refresh the file list after upload
-      const res = await fetchFolderFiles(selectedWeek, selectedFolder);
-      setFiles(res.files);
+      const res = await apiUpload(selectedWeek, selectedFolder, file);
+      // Refresh the file list after upload — the file is in bronze
+      // immediately even if the ETL run is still pending.
+      const refreshed = await fetchFolderFiles(selectedWeek, selectedFolder);
+      setFiles(refreshed.files);
+
+      // If the backend kicked off an ETL run, start polling for status.
+      // Cancel any prior timer first so we don't end up with two loops
+      // racing (e.g. quick successive uploads).
+      if (res?.etl_run_id) {
+        if (etlPollTimerRef.current) {
+          clearTimeout(etlPollTimerRef.current);
+          etlPollTimerRef.current = null;
+        }
+        setEtlStatus({
+          phase: "running",
+          runId: res.etl_run_id,
+          runPageUrl: res.etl_run_url,
+          message: "ETL pipeline running — chunking and embedding new content…",
+        });
+        // Kick off the loop immediately; subsequent ticks self-schedule.
+        pollEtlRunOnce(res.etl_run_id, res.etl_run_url);
+      }
     } catch (e) {
       setError(e.message);
       throw e;
     }
-  }, [selectedWeek, selectedFolder]);
+  }, [selectedWeek, selectedFolder, pollEtlRunOnce]);
+
+  // Stop polling on unmount. The timer ref lives across renders, so the
+  // cleanup function captured by useEffect can safely call clearTimeout
+  // on whatever's pending — clearTimeout on null/undefined is a no-op.
+  useEffect(() => {
+    return () => {
+      if (etlPollTimerRef.current) {
+        clearTimeout(etlPollTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Reset the ETL toast back to idle. Used by the page's auto-dismiss
+  // effect for "success" and by the toast's ✕ button for "failed"/"error".
+  // Also kills any in-flight poll timer so a manual dismiss doesn't get
+  // re-overwritten by a late-arriving fetch.
+  const clearEtlStatus = useCallback(() => {
+    if (etlPollTimerRef.current) {
+      clearTimeout(etlPollTimerRef.current);
+      etlPollTimerRef.current = null;
+    }
+    setEtlStatus({ phase: "idle", runId: null, runPageUrl: null, message: "" });
+  }, []);
 
   // Drives the cascade delete from the UI side.
   //
@@ -182,6 +322,7 @@ export function useCurriculum() {
     loading,
     error,
     deleteStatus,
+    etlStatus,
     loadWeeks,
     selectWeek,
     selectFolder,
@@ -190,5 +331,6 @@ export function useCurriculum() {
     uploadFile,
     deleteFile,
     clearDeleteStatus,
+    clearEtlStatus,
   };
 }

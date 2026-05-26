@@ -31,6 +31,21 @@ export async function fetchFolderFiles(week, folder) {
   return res.json(); // { files: [{name, path, size_bytes, last_modified}] }
 }
 
+// Uploads a file to bronze and (server-side) fires the curriculum ETL job
+// via jobs.run_now() so the admin gets near-instant feedback instead of
+// waiting for the 5-minute file_arrival safety-net trigger.
+//
+// The response now carries two extra fields:
+//   etl_run_id:  number | null  — the Databricks Jobs run_id, used by the
+//                                 useCurriculum hook to poll the status
+//                                 endpoint below until the run terminates.
+//   etl_run_url: string | null  — deep link into the Databricks Jobs UI for
+//                                 the toast's "view run" affordance.
+//
+// Either field is null if the backend couldn't start the run (e.g. the
+// bundle hasn't been deployed yet). In that case the upload still succeeded
+// and the file_arrival trigger will catch it eventually — the UI just
+// suppresses the ETL toast.
 export async function uploadFile(week, folder, file) {
   const form = new FormData();
   form.append("file", file);
@@ -38,7 +53,42 @@ export async function uploadFile(week, folder, file) {
     method: "POST",
     body: form,
   });
-  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+  if (!res.ok) {
+    // Surface the backend's `detail` (e.g. extension validation message)
+    // through Error.message so the UI can show why the upload was rejected.
+    let detail = `Upload failed: ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      // Response wasn't JSON — keep the status-code message.
+    }
+    throw new Error(detail);
+  }
+  // { uploaded, path, etl_run_id, etl_run_url }
+  return res.json();
+}
+
+// Polls the backend for the state of a single ETL job run. Called every
+// few seconds by useCurriculum until is_terminal === true.
+//
+// Returns the shape documented in app/admin.py:get_etl_run:
+//   { run_id, life_cycle_state, result_state, state_message, is_terminal, run_page_url }
+//
+// Throws on 404 (run not found — stop polling) or other HTTP errors. The
+// caller is expected to catch and surface the failure in the toast.
+export async function fetchEtlRun(runId) {
+  const res = await fetch(`${base()}/admin/curriculum/etl-run/${runId}`);
+  if (!res.ok) {
+    let detail = `ETL run fetch failed: ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      // Non-JSON response — keep the status-code message.
+    }
+    throw new Error(detail);
+  }
   return res.json();
 }
 

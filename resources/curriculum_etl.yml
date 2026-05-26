@@ -41,22 +41,20 @@ resources:
       # catastrophic (MERGE is atomic per-statement) but wasted work.
       max_concurrent_runs: 1
 
-      # File-arrival trigger: monitor the entire bronze curriculum volume.
-      # wait_after_last_change_seconds gives a bursty upload (admin dragging
-      # in 5 files at once) time to settle into one job run.
-      # min_time_between_triggers_seconds caps how often the trigger can fire
-      # so a rapid sequence of single uploads doesn't spawn many runs.
+      # NO trigger block here on purpose. Earlier iterations carried a
+      # file_arrival trigger as a safety net for non-UI uploads, but the
+      # FastAPI backend already fires `jobs.run_now()` immediately after
+      # every successful upload (see app/admin.py:upload_file). Having
+      # both produced a double-run-per-upload pattern: run_now fired
+      # Run A right away, then file_arrival's wait_after_last_change
+      # timer expired and fired a redundant Run B that MERGEd zero new
+      # chunks. Confusing from the Jobs UI and wasted compute.
       #
-      # Note: the Databricks Jobs API enforces a minimum of >60s on
-      # wait_after_last_change_seconds. Using 90s here as a safe value above
-      # the floor — gives an admin uploading a folder of files time to
-      # finish without splitting the batch across multiple runs.
-      trigger:
-        pause_status: UNPAUSED
-        file_arrival:
-          url: "/Volumes/capstone/bronze_layer/curriculum_raw/"
-          wait_after_last_change_seconds: 90
-          min_time_between_triggers_seconds: 60
+      # All ingestion goes through the admin upload endpoint now. If
+      # someone drops files directly into the bronze volume (Databricks
+      # workspace UI, a notebook, etc.) they can manually trigger this
+      # job via `databricks jobs run-now` or the Jobs UI's "Run now"
+      # button. The job is otherwise quiet.
 
       # Serverless environments shared by both tasks. Spark Python tasks
       # require an environment_key (unlike notebook tasks) to opt into

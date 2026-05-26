@@ -38,6 +38,18 @@ export default function CurriculumPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [curriculum.deleteStatus.phase]);
 
+  // Same auto-dismiss pattern for the ETL "success" toast. Failures and
+  // errors stick around until the admin clicks ✕ because they usually
+  // mean somebody needs to look at the Databricks run page — letting the
+  // toast fade out would risk losing the run_page_url link before the
+  // admin saw it.
+  useEffect(() => {
+    if (curriculum.etlStatus.phase !== "success") return;
+    const t = setTimeout(() => curriculum.clearEtlStatus(), 6000);
+    return () => clearTimeout(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [curriculum.etlStatus.phase]);
+
   const handleUpload = async (file) => {
     setUploading(true);
     try {
@@ -188,6 +200,90 @@ export default function CurriculumPage() {
         </div>
       )}
 
+      {/*
+        ETL status toast.
+        Mirrors the delete-cascade toast styling so both kinds of in-flight
+        admin operations look like siblings. Phases:
+          - "running": spinner + message, no dismiss (run is still going).
+          - "success": auto-dismisses after 6s via the page-level effect above.
+          - "failed":  red styling, manual dismiss, shows the result_state.
+          - "error":   red styling, manual dismiss, used when polling itself
+                       errors out (404, network blip, etc.).
+        The deep link to the Databricks run page is rendered as a tiny
+        "view run" affordance when we have one — admins click through to
+        see the DAG when something looks off.
+      */}
+      {curriculum.etlStatus.phase !== "idle" && (
+        <div style={{
+          background:
+            curriculum.etlStatus.phase === "failed" || curriculum.etlStatus.phase === "error"
+              ? colors.errorBg : colors.surface,
+          color:
+            curriculum.etlStatus.phase === "failed" || curriculum.etlStatus.phase === "error"
+              ? colors.errorFg : colors.text,
+          border: `1px solid ${
+            curriculum.etlStatus.phase === "failed" || curriculum.etlStatus.phase === "error"
+              ? colors.errorFg : colors.border
+          }`,
+          borderRadius: 6,
+          padding: "10px 14px",
+          marginBottom: 16,
+          fontSize: 13,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1 }}>
+            {curriculum.etlStatus.phase === "running" && (
+              <span style={{
+                display: "inline-block",
+                width: 12, height: 12,
+                border: `2px solid ${colors.border}`,
+                borderTopColor: colors.accent,
+                borderRadius: "50%",
+                animation: "pathwise-spin 0.8s linear infinite",
+              }} />
+            )}
+            <span style={{ flex: 1 }}>{curriculum.etlStatus.message}</span>
+            {/* Deep link into the Databricks Jobs UI for this specific run.
+                Always rendered when we have a URL, regardless of phase —
+                admins want this most when the run is still running OR when
+                it just failed and they need to read the task driver log. */}
+            {curriculum.etlStatus.runPageUrl && (
+              <a
+                href={curriculum.etlStatus.runPageUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  color: "inherit",
+                  textDecoration: "underline",
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                view run ↗
+              </a>
+            )}
+          </div>
+          {/* Dismiss button: hidden while running (UI can't cancel a Databricks
+              job from here), shown on terminal states so the toast can be
+              dismissed when the admin is done reading. */}
+          {curriculum.etlStatus.phase !== "running" && (
+            <button
+              onClick={curriculum.clearEtlStatus}
+              style={{
+                background: "transparent", border: "none", padding: "0 4px",
+                cursor: "pointer", fontSize: 14, lineHeight: 1, color: "inherit",
+              }}
+              aria-label="Dismiss"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Week list */}
       {curriculum.view === "weeks" && (
         <WeekList
@@ -209,7 +305,19 @@ export default function CurriculumPage() {
       {/* File list + drop zone */}
       {curriculum.view === "files" && (
         <>
-          <FileDropZone onUpload={handleUpload} uploading={uploading} />
+          {/*
+            Gate uploads on BOTH the in-flight POST (`uploading`) and an
+            in-flight ETL run (`etlStatus.phase === "running"`). The drop
+            zone shows distinct messages for the two, but treats both as
+            "don't accept new files right now" — uploading a second file
+            mid-ETL would race two MERGEs against the silver table and
+            generally cost more time than just waiting.
+          */}
+          <FileDropZone
+            onUpload={handleUpload}
+            uploading={uploading}
+            etlRunning={curriculum.etlStatus.phase === "running"}
+          />
           <FileList
             files={curriculum.files}
             loading={curriculum.loading}

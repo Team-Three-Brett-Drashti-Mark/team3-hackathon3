@@ -79,6 +79,12 @@ _warehouse_id: str | None = None
 # would defeat the lazy-import savings below. Materialized on first call to
 # _vector_client() and reused for the process lifetime.
 _vs_client = None
+# Curriculum-ETL job ID. Resolved on first upload by searching the workspace
+# for the deployed job (see _get_etl_job_id below), then cached for the
+# process lifetime since the job ID is stable once the Asset Bundle is
+# deployed. Reset to None if the upload-triggered run_now fails — that's
+# usually the signal that the job was renamed or redeployed.
+_etl_job_id: int | None = None
 
 
 def _client() -> WorkspaceClient:
@@ -112,6 +118,65 @@ def _vector_client():
         from databricks.vector_search.client import VectorSearchClient
         _vs_client = VectorSearchClient(disable_notice=True)
     return _vs_client
+
+
+def _get_etl_job_id() -> int:
+    """
+    Return the curriculum ETL job ID, resolving it on first call.
+
+    The job is created by `databricks bundle deploy` (see
+    resources/curriculum_etl.yml) and named like:
+        "[dev w_brett_coleman] [dev] Curriculum ETL"
+    The username/target prefix differs per developer/environment, so we
+    can't hardcode the full name — we filter by the trailing "Curriculum
+    ETL" segment, which is set by the bundle resource key.
+
+    Allows an explicit override via the CURRICULUM_ETL_JOB_ID env var. That
+    knob exists for two reasons:
+      1. A future migration to a service-principal deploy where the bundle
+         name suffix changes.
+      2. Local debugging where you want to point at a specific job ID
+         without re-deploying.
+
+    Raises HTTPException(500) if no matching job is found — the upload path
+    catches and degrades to "uploaded but no ETL run started", so the file
+    still lands in bronze even if the job can't be found.
+    """
+    global _etl_job_id
+    if _etl_job_id is not None:
+        return _etl_job_id
+
+    override = os.environ.get("CURRICULUM_ETL_JOB_ID")
+    if override:
+        try:
+            _etl_job_id = int(override)
+            return _etl_job_id
+        except ValueError:
+            # Bad env var — fall through to workspace lookup rather than
+            # crashing the whole upload flow on a typo.
+            logger.warning("CURRICULUM_ETL_JOB_ID is not an int: %r", override)
+
+    client = _client()
+    # jobs.list() returns BaseJob objects with .job_id and .settings.name.
+    # We expect O(10s) of jobs in this workspace so a full list scan is fine;
+    # if this grows to 100s, switch to a server-side name filter.
+    for job in client.jobs.list():
+        name = (job.settings.name if job.settings else "") or ""
+        if name.endswith("Curriculum ETL"):
+            if job.job_id is None:
+                continue
+            _etl_job_id = job.job_id
+            logger.info("Resolved curriculum ETL job: id=%d name=%r",
+                        _etl_job_id, name)
+            return _etl_job_id
+
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            "No curriculum ETL job found in the workspace. "
+            "Run `databricks bundle deploy` to create it."
+        ),
+    )
 
 
 def _sql_escape(value: str) -> str:
@@ -526,12 +591,102 @@ async def upload_file(week: str, folder: str, file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    # The file-arrival-triggered ETL job picks up the new file ~30s after
-    # upload (file_arrival.wait_after_last_change_seconds) and runs silver
-    # chunking + vector sync. Status of that run is visible in the Databricks
-    # Jobs UI; we don't surface it here to keep the upload response shape
-    # stable and the UI flow simple.
-    return {"uploaded": filename, "path": path}
+    # ── Fire the ETL job directly via jobs.run_now() ─────────────────────────
+    # The file_arrival trigger on the bronze volume still exists as a safety
+    # net (see resources/curriculum_etl.yml), but its debounce is set to
+    # 300s — too slow for UI feedback. We know the moment a file lands
+    # because we just performed the upload, so we trigger the job
+    # immediately. Cold-start latency on serverless is ~5-15s; warm is 1-3s.
+    #
+    # If anything goes wrong here we still report success on the upload
+    # itself — the file is in bronze, the file_arrival trigger will catch
+    # it within 5 minutes as a fallback, and an admin can manually trigger
+    # the job in the meantime. The etl_run_id/url fields just stay null in
+    # that case so the UI knows there's no run to poll.
+    etl_run_id: int | None = None
+    etl_run_url: str | None = None
+    try:
+        job_id = _get_etl_job_id()
+        # run_now returns a Run object with run_id; we capture it so the UI
+        # can poll the /etl-run/{run_id} endpoint without round-tripping the
+        # entire job's recent-runs list.
+        run = client.jobs.run_now(job_id=job_id)
+        if run.run_id is not None:
+            etl_run_id = run.run_id
+            host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
+            etl_run_url = f"{host}/#job/{job_id}/run/{run.run_id}" if host else None
+    except HTTPException as exc:
+        # Already an HTTPException — log the detail and keep the upload OK.
+        logger.warning("Could not start ETL run after upload: %s", exc.detail)
+    except Exception as exc:
+        logger.warning("Could not start ETL run after upload: %s", exc)
+        # Reset the cached job ID — if run_now failed because the cached ID
+        # is stale (job redeployed/recreated), next call will re-resolve.
+        global _etl_job_id
+        _etl_job_id = None
+
+    return {
+        "uploaded": filename,
+        "path": path,
+        "etl_run_id": etl_run_id,
+        "etl_run_url": etl_run_url,
+    }
+
+
+# ── ETL run status (for UI polling) ───────────────────────────────────────────
+
+@router.get("/curriculum/etl-run/{run_id}")
+def get_etl_run(run_id: int):
+    """
+    Return a UI-friendly snapshot of an ETL job run.
+
+    Called every few seconds by the admin curriculum page after an upload to
+    drive the "ETL running / done / failed" toast. The shape is deliberately
+    flatter than the raw `Run` SDK object — the UI only cares about whether
+    we've reached a terminal state, what to show in the toast, and where to
+    link if the admin wants to see the DAG in Databricks.
+
+    `is_terminal` is the signal the UI uses to stop polling. The Databricks
+    Jobs API uses two coupled fields:
+      - life_cycle_state: PENDING / RUNNING / TERMINATING / TERMINATED /
+                          SKIPPED / INTERNAL_ERROR
+      - result_state:     SUCCESS / FAILED / TIMEDOUT / CANCELED (only set
+                          when the life cycle is terminal)
+    A run is "done" iff life_cycle_state ∈ {TERMINATED, SKIPPED, INTERNAL_ERROR}.
+
+    Returns:
+        {
+          run_id: int,
+          life_cycle_state: str | None,
+          result_state: str | None,
+          state_message: str,        # short human-readable status from the API
+          is_terminal: bool,
+          run_page_url: str | None,  # deep link into Databricks Jobs UI
+        }
+    """
+    client = _client()
+    try:
+        run = client.jobs.get_run(run_id=run_id)
+    except Exception as exc:
+        # Most likely a 404 (run was deleted, or a typo'd ID) — propagate as
+        # 404 so the UI knows to stop polling rather than retry forever.
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    state = run.state
+    lcs = state.life_cycle_state.value if state and state.life_cycle_state else None
+    rs  = state.result_state.value if state and state.result_state else None
+    msg = (state.state_message if state else None) or ""
+
+    is_terminal = lcs in {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+
+    return {
+        "run_id":           run.run_id,
+        "life_cycle_state": lcs,
+        "result_state":     rs,
+        "state_message":    msg,
+        "is_terminal":      is_terminal,
+        "run_page_url":     run.run_page_url,
+    }
 
 
 class DeleteFileRequest(BaseModel):
