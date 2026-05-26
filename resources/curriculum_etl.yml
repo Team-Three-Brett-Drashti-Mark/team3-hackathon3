@@ -48,22 +48,18 @@ resources:
       # so the admin sees ETL progress in seconds, not minutes (see
       # app/admin.py:upload_file).
       #
-      # Debounce is set HIGH on purpose: with the UI path firing run_now
-      # directly, we want this trigger to almost never double-fire when the
-      # UI is doing its job. 300s is long enough that an admin-initiated
-      # batch upload of N files produces exactly one run_now-triggered job
-      # run (started immediately) and zero file_arrival-triggered runs.
-      # If a user drops files directly into the volume outside the UI, this
-      # still catches them after a 5-minute settle period.
-      #
-      # max_concurrent_runs=1 above serializes anything that does double-
-      # fire, so worst case we get one redundant run that finds nothing new
-      # to MERGE.
+      # Why 61 seconds: the Databricks Jobs API enforces a minimum of
+      # >60s on wait_after_last_change_seconds, so 61 is the floor. We
+      # keep this trigger as low as possible so non-UI uploads also get
+      # processed quickly. The UI path fires its own run_now immediately
+      # on upload (see admin.py), and max_concurrent_runs=1 above serializes
+      # anything that does double-fire — so worst case from this trigger
+      # is one redundant run that MERGEs zero new chunks.
       trigger:
         pause_status: UNPAUSED
         file_arrival:
           url: "/Volumes/capstone/bronze_layer/curriculum_raw/"
-          wait_after_last_change_seconds: 300
+          wait_after_last_change_seconds: 61
           min_time_between_triggers_seconds: 60
 
       # Serverless environments shared by both tasks. Spark Python tasks
