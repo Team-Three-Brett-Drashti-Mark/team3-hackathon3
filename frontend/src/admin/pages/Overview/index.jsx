@@ -17,7 +17,7 @@ export default function OverviewPage() {
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 24 }}>
         <div>
           <h1 style={{ margin: 0, fontSize: 22, fontWeight: 800, color: colors.text }}>Overview</h1>
-          <p style={{ margin: "4px 0 0", fontSize: 13, color: colors.muted }}>Past 7 days</p>
+          <p style={{ margin: "4px 0 0", fontSize: 13, color: colors.muted }}>Past 10 days</p>
         </div>
         <button
           onClick={() => setRefreshKey(Date.now())}
