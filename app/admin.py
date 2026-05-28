@@ -950,6 +950,31 @@ def delete_file(body: DeleteFileRequest):
 
 # ── Audit Log ─────────────────────────────────────────────────────────────────
 
+# Audit-page response cache. Same shape as _overview_cache above but keyed by
+# (page, limit, intent) because the audit log paginates and filters — there's
+# no single canonical payload to cache.
+#
+# Why a cache at all: this endpoint is hit on every admin "Audit Log" page
+# load, on every page-change click, and on every intent-filter change. Each
+# call round-trips Databricks at least once (see the SQL below). At ~1-3s
+# of unavoidable Statement Execution API overhead per call, repeated clicks
+# add up fast. Caching for 30s makes refresh / page-flip / re-filter feel
+# instant for the common pattern of an admin browsing recent activity.
+#
+# Why 30s (vs the 60s on _overview_cache): the audit log is the page admins
+# stare at when chat traffic is happening in real time — they want new rows
+# to show up promptly. 30s is the longest delay that still feels responsive
+# for a "what's happening right now" view.
+#
+# Why no eviction logic: the keyspace is naturally bounded. Intent has 4
+# possible values (curriculum / answer_seeking / off_topic / ""), pages are
+# typically in the single digits even for a busy week, and limit is a UI
+# constant. Worst case the dict holds O(tens) of entries, each ~50 rows ×
+# ~2KB = a few MB. Not worth a TTL sweeper.
+_audit_cache: dict[tuple[int, int, str], tuple[float, dict]] = {}
+_AUDIT_TTL = 30.0
+
+
 @router.get("/audit")
 def get_audit_log(page: int = 1, limit: int = 50, intent: str = ""):
     """
@@ -962,27 +987,73 @@ def get_audit_log(page: int = 1, limit: int = 50, intent: str = ""):
                 (valid values: curriculum, answer_seeking, off_topic)
 
     Returns: { entries: [...], total: int, page: int, limit: int }
+
+    Performance notes:
+      - The previous version fired TWO sequential Statement Execution API
+        calls per request: one for the page rows, one for COUNT(*). Each
+        call carries ~2-6s of Databricks API overhead (HTTP round-trip +
+        statement planning + result manifest fetch) even on a warm
+        warehouse — wall-clock was ~13s for queries that themselves take
+        <50ms against a 210-row table. We collapse both into a single
+        query using COUNT(*) OVER(), which attaches the unfiltered (well,
+        post-WHERE) row total to every result row at negligible cost in
+        the same query plan.
+      - Results are cached for 30s keyed by (page, limit, intent) — see
+        the _audit_cache comment above for the rationale.
+      - When the combined query returns zero rows (admin paged past the
+        end of a filtered set), we lose the window-function output and
+        need to fall back to a one-shot COUNT(*) so the UI still gets an
+        accurate total and can correct itself. This path is rare in
+        normal UI flow (useAuditLog resets page=1 on filter change) so
+        the extra round-trip only fires on a curl typo or a stale URL.
     """
+    # Cache lookup happens BEFORE building any SQL — a cache hit returns the
+    # exact same object the admin saw on a previous request within the TTL,
+    # which is what we want for repeat clicks / refreshes.
+    cache_key = (page, limit, intent)
+    cached = _audit_cache.get(cache_key)
+    if cached is not None and (time.monotonic() - cached[0]) < _AUDIT_TTL:
+        return cached[1]
+
     offset = (page - 1) * limit
 
-    # Build the optional WHERE clause fragment. The intent value comes from
-    # a dropdown in the UI so it's constrained, but in production this should
-    # be parameterized — noted here for future hardening.
-    intent_filter = f"AND intent = '{intent}'" if intent else ""
+    # The intent value comes from a constrained dropdown in the UI, but the
+    # endpoint is also reachable via curl/direct HTTP. _sql_escape() keeps
+    # this interpolation consistent with the rest of the file's SQL pattern
+    # until the _execute helper is upgraded to thread parameters through.
+    intent_filter = f"AND intent = '{_sql_escape(intent)}'" if intent else ""
 
-    # Fetch the requested page of log rows.
+    # Single round-trip: page rows + total count via window function.
+    # COUNT(*) OVER() with no PARTITION BY computes a single value over the
+    # whole filtered result set and repeats it on every row. The window
+    # executes inside the same scan, so the additional cost over a plain
+    # SELECT is essentially free at this table size (210 rows today; would
+    # remain cheap at much higher cardinality because the engine still only
+    # has to evaluate the predicate once).
     rows = _run_sql(f"""
-        SELECT log_id, session_id, timestamp, user_input, system_output, intent, attempt
+        SELECT log_id, session_id, timestamp, user_input, system_output, intent, attempt,
+               COUNT(*) OVER() AS total_count
         FROM interaction_logs
         WHERE 1=1 {intent_filter}
         ORDER BY timestamp DESC
         LIMIT {limit} OFFSET {offset}
     """)
 
-    # Fetch the total count so the frontend can calculate page count.
-    count_rows = _run_sql(f"""
-        SELECT COUNT(*) FROM interaction_logs WHERE 1=1 {intent_filter}
-    """)
+    if rows:
+        # COUNT(*) OVER() emits the same total on every row — read it off the
+        # first row. Index 7 is the trailing column we appended to the SELECT.
+        total = int(rows[0][7]) if rows[0][7] is not None else 0
+    else:
+        # Empty page → no row carries the window result. Fall back to a cheap
+        # COUNT(*) so the frontend still receives an accurate total and can
+        # bounce the user back to a valid page. We intentionally do NOT cache
+        # the empty-rows case under a different key — the cache key already
+        # captures (page, limit, intent), so the same empty payload will be
+        # served from cache on retry until TTL expires.
+        count_rows = _run_sql(
+            f"SELECT COUNT(*) FROM interaction_logs WHERE 1=1 {intent_filter}"
+        )
+        total = int(count_rows[0][0]) if count_rows and count_rows[0][0] else 0
 
     entries = [
         {
@@ -998,9 +1069,11 @@ def get_audit_log(page: int = 1, limit: int = 50, intent: str = ""):
         for r in rows
     ]
 
-    return {
+    payload = {
         "entries": entries,
-        "total":   int(count_rows[0][0]) if count_rows and count_rows[0][0] else 0,
+        "total":   total,
         "page":    page,
         "limit":   limit,
     }
+    _audit_cache[cache_key] = (time.monotonic(), payload)
+    return payload
