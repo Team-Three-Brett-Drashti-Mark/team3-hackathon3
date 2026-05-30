@@ -53,7 +53,7 @@ export default function OverviewPage() {
           loading={loading}
         />
         <StatCard
-          label="Questions this week"
+          label="Total questions asked"
           value={data?.total_week ?? 0}
           loading={loading}
         />
@@ -75,7 +75,10 @@ export default function OverviewPage() {
         marginBottom: 20,
       }}>
         <div style={{ ...labelStyle, marginBottom: 14 }}>Daily questions asked</div>
-        <DailyUsageChart data={data?.daily ?? []} />
+        {/* The backend view can return an arbitrary history; cap to the most
+            recent 10 days so the chart matches the "Past 10 days" header and
+            stays readable. daily is sorted ascending, so slice(-10) is newest. */}
+        <DailyUsageChart data={(data?.daily ?? []).slice(-10)} />
       </div>
 
       {/* Two-column row: hourly activity + intent breakdown */}
