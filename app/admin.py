@@ -424,7 +424,11 @@ def get_overview():
         "hourly_activity":  results["hourly"],
         # total_today is derived from daily so we don't need a separate query.
         "total_today":      next((d["count"] for d in daily if d["date"] == today_str), 0),
-        "total_week":       sum(d["count"] for d in daily),
+        # Sum only the most recent 10 days so this lines up with the dashboard's
+        # "Past 10 days" framing and the (also 10-day-capped) daily chart, rather
+        # than summing the view's entire history. daily is sorted ascending, so
+        # the last 10 entries are the newest.
+        "total_week":       sum(d["count"] for d in daily[-10:]),
         "behind_count":     int(behind_rows[0][0]) if behind_rows and behind_rows[0][0] else 0,
         "intent_breakdown": results["intent"],
     }
