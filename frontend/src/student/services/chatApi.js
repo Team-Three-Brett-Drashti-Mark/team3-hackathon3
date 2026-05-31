@@ -1,5 +1,5 @@
 // Sends one chat turn to the Pathwise backend and returns parsed JSON.
-// Throws on network failure — callers must handle errors.
+// Throws on both network failures and non-2xx HTTP responses.
 export async function sendChatMessage({
   userInput,
   lessonContext,
@@ -19,5 +19,14 @@ export async function sendChatMessage({
       conversation_history: conversationHistory,
     }),
   });
-  return res.json();
+
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : {};
+
+  if (!res.ok) {
+    const detail = data?.detail || data?.message || text || `Request failed with status ${res.status}`;
+    throw new Error(`HTTP ${res.status}: ${detail}`);
+  }
+
+  return data;
 }

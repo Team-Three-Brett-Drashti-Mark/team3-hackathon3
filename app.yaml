@@ -12,8 +12,8 @@ command:
 
 env:
   - name: GROQ_API_KEY
-    value: '{{secrets/pathwise-secrets/GROQ_API_KEY}}'
+    valueFrom: groq_api_key
   - name: DATABRICKS_HOST
-    value: '{{secrets/pathwise-secrets/DATABRICKS_HOST}}'
+    valueFrom: databricks_host
   - name: DATABRICKS_TOKEN
-    value: '{{secrets/pathwise-secrets/DATABRICKS_TOKEN}}'
+    valueFrom: databricks_token

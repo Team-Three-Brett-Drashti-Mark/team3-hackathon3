@@ -94,6 +94,7 @@ def _client() -> WorkspaceClient:
         _ws_client = WorkspaceClient(
             host=os.environ["DATABRICKS_HOST"],
             token=os.environ["DATABRICKS_TOKEN"],
+            auth_type="pat",
         )
     return _ws_client
 
@@ -215,7 +216,7 @@ def _get_warehouse_id() -> str:
     running = [w for w in warehouses if str(w.state).upper() == "RUNNING"]
     chosen = (running or warehouses)[0]
     if chosen.id is None:
-        raise HTTPException(status_code=500, detail="No SQL warehouses available")
+        raise HTTPException(status_code=500, detail="No SQL warehouse ID available")
 
     _warehouse_id = chosen.id
     return _warehouse_id
@@ -383,697 +384,582 @@ def get_overview():
     global _overview_cache, _overview_cache_ts
 
     # Return the cached payload if it's still fresh.
-    if _overview_cache is not None and (time.monotonic() - _overview_cache_ts) < _OVERVIEW_TTL:
+    now = time.monotonic()
+    if _overview_cache is not None and (now - _overview_cache_ts) < _OVERVIEW_TTL:
         return _overview_cache
 
-    # SQL for sessions that hit the hard block (3rd answer-seeking attempt).
-    # No view exists for this yet, so we query interaction_logs directly.
-    BEHIND_SQL = """
-        SELECT COUNT(DISTINCT session_id) AS n
-        FROM interaction_logs
-        WHERE attempt >= 3
-          AND timestamp >= DATE_SUB(CURRENT_DATE(), 7)
-    """
+    def _fetch_daily():
+        return _normalize_daily(_query_view("v_daily_usage"))
 
-    # Each task is a zero-argument lambda so ThreadPoolExecutor can call it
-    # without needing to pass arguments through the future interface.
-    tasks = {
-        "daily":  lambda: _normalize_daily(_query_view("v_daily_usage")),
-        "intent": lambda: _normalize_intent(_query_view("v_intent_breakdown")),
-        "hourly": lambda: _normalize_hourly(_query_view("v_hourly_activity")),
-        "behind": lambda: _run_sql(BEHIND_SQL),
-    }
+    def _fetch_intent():
+        return _normalize_intent(_query_view("v_intent_breakdown"))
 
-    # Fire all four queries concurrently. On a warm warehouse each takes ~2s;
-    # sequentially that was ~10-15s total — in parallel it's just the slowest one.
-    results: dict = {}
+    def _fetch_hourly():
+        return _normalize_hourly(_query_view("v_hourly_activity"))
+
+    def _fetch_behind():
+        # Sessions that reached attempt 3+ in the last 7 days.
+        rows = _run_sql(
+            """
+            SELECT COUNT(DISTINCT session_id) AS n
+            FROM interaction_logs
+            WHERE attempt >= 3
+              AND timestamp >= DATE_SUB(CURRENT_DATE(), 7)
+            """
+        )
+        return int(rows[0][0] or 0) if rows else 0
+
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(fn): key for key, fn in tasks.items()}
-        for future in as_completed(futures):
-            key = futures[future]
-            # Calling .result() re-raises any exception from the worker thread
-            # on the main thread, which FastAPI converts to a 500 response.
-            results[key] = future.result()
+        futures = {
+            pool.submit(_fetch_daily):  "daily",
+            pool.submit(_fetch_intent): "intent",
+            pool.submit(_fetch_hourly): "hourly",
+            pool.submit(_fetch_behind): "behind",
+        }
+
+        results = {}
+        for fut in as_completed(futures):
+            key = futures[fut]
+            try:
+                results[key] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Overview metric fetch failed for %s", key)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Overview metric '{key}' failed: {type(exc).__name__}: {exc}",
+                ) from exc
 
     daily = results["daily"]
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    behind_rows = results["behind"]
-
-    payload = {
-        "daily":            daily,
-        "hourly_activity":  results["hourly"],
-        # total_today is derived from daily so we don't need a separate query.
-        "total_today":      next((d["count"] for d in daily if d["date"] == today_str), 0),
-        "total_week":       sum(d["count"] for d in daily),
-        "behind_count":     int(behind_rows[0][0]) if behind_rows and behind_rows[0][0] else 0,
+    overview = {
+        "daily": daily,
+        "hourly_activity": results["hourly"],
+        # "today" = most recent day in the daily series. This avoids timezone drift
+        # between the SQL view and the app server and matches what the chart shows.
+        "total_today": daily[-1]["count"] if daily else 0,
+        # The stat card label says "Total questions asked". Keep this as the total
+        # across all days returned by the view (typically last 7 days), not just 7.
+        "total_week": sum(d["count"] for d in daily),
+        "behind_count": results["behind"],
         "intent_breakdown": results["intent"],
     }
 
-    # Store in cache with the current timestamp.
-    _overview_cache = payload
-    _overview_cache_ts = time.monotonic()
-    return payload
-
-
-# ── Curriculum / Volume ───────────────────────────────────────────────────────
-
-@router.get("/curriculum/weeks")
-def list_weeks():
-    """
-    List the top-level week folders inside the Bronze curriculum volume.
-    Returns: { weeks: [{ name: str, path: str }] }
-    """
-    client = _client()
-    try:
-        entries = list(client.files.list_directory_contents(VOLUME_ROOT))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    # Filter to directories only — any stray files at the root are ignored.
-    weeks = [
-        {
-            "name": (e.path or "").rstrip("/").split("/")[-1],
-            "path": e.path,
-        }
-        for e in entries
-        if e.is_directory
-    ]
-    return {"weeks": weeks}
+    # Cache the freshly computed payload.
+    _overview_cache = overview
+    _overview_cache_ts = now
+    return overview
 
 
 class CreateWeekRequest(BaseModel):
     week_name: str
 
 
+class DeleteFileRequest(BaseModel):
+    path: str
+
+
+def _week_path(week_name: str) -> str:
+    # Basic normalization: spaces → underscores, strip leading/trailing slashes.
+    safe = week_name.strip().replace(" ", "_")
+    if not safe:
+        raise HTTPException(status_code=400, detail="Week name is required")
+    return f"{VOLUME_ROOT}/{safe}"
+
+
+def _list_dir(path: str):
+    client = _client()
+    try:
+        return list(client.files.list_directory_contents(path))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"List failed for {path}: {exc}") from exc
+
+
+@router.get("/curriculum/weeks")
+def list_weeks():
+    entries = _list_dir(VOLUME_ROOT)
+    weeks = []
+    for e in entries:
+        if getattr(e, "is_directory", False):
+            weeks.append({"name": e.name, "path": e.path})
+    weeks.sort(key=lambda w: w["name"])
+    return {"weeks": weeks}
+
+
 @router.post("/curriculum/weeks")
-def create_week(body: CreateWeekRequest):
-    """
-    Create a new week folder in the volume with the standard subfolders.
-
-    The Databricks Files API has no single "mkdir -p" call, so we create
-    each subfolder individually. All three must succeed or we surface the error.
-
-    Returns: { created: str, subfolders: list[str] }
-    """
-    name = body.week_name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="week_name is required")
-
+def create_week(req: CreateWeekRequest):
     client = _client()
-    week_root = f"{VOLUME_ROOT}/{name}"
+    week_root = _week_path(req.week_name)
 
     try:
-        for subfolder in WEEK_SUBFOLDERS:
-            client.files.create_directory(f"{week_root}/{subfolder}")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        client.files.create_directory(week_root)
+        for sub in WEEK_SUBFOLDERS:
+            client.files.create_directory(f"{week_root}/{sub}")
+        return {"created": True, "path": week_root}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Create week failed: {exc}") from exc
 
-    return {"created": name, "subfolders": WEEK_SUBFOLDERS}
+
+@router.get("/curriculum/weeks/{week_name}/{folder_name}")
+def list_folder_files(week_name: str, folder_name: str):
+    folder_path = f"{_week_path(week_name)}/{folder_name}"
+    entries = _list_dir(folder_path)
+    files = []
+    for e in entries:
+        if not getattr(e, "is_directory", False):
+            files.append(
+                {
+                    "name": e.name,
+                    "path": e.path,
+                    "size_bytes": getattr(e, "file_size", None),
+                    "last_modified": getattr(e, "last_modified", None),
+                }
+            )
+    files.sort(key=lambda f: f["name"])
+    return {"files": files}
 
 
-@router.get("/curriculum/weeks/{week}/{folder}")
-def list_folder_files(week: str, folder: str):
+def _parse_volume_path(volume_path: str) -> tuple[str, str, str, str, str]:
     """
-    List files inside a specific subfolder of a week.
+    Parse a curriculum bronze volume path into its semantic pieces.
 
-    Only the three known subfolders are allowed — anything else is rejected
-    to prevent path traversal into arbitrary volume locations.
+    Input shape (enforced):
+        /Volumes/<catalog>/<schema>/<volume>/<week>/<folder>/<file>
 
-    Returns: { files: [{ name, path, size_bytes, last_modified }], week, folder }
+    We only support files under the configured curriculum bronze root, because
+    the delete cascade needs to know the `week`, `folder`, and `filename` to
+    remove corresponding rows from the silver/vector tables.
+
+    Returns:
+        (catalog, schema, volume, week, file_name)
+
+    Notes:
+      * `folder` itself isn't returned because the downstream tables store the
+        semantic `content_type` derived from that segment, not the raw folder
+        name. The mapping is handled by _volume_folder_to_content_type().
+      * Raises HTTP 400 (not 500) for malformed user input — this is a client
+        error, not a server fault.
     """
-    if folder not in WEEK_SUBFOLDERS:
-        raise HTTPException(status_code=400, detail=f"folder must be one of {WEEK_SUBFOLDERS}")
-
-    path = f"{VOLUME_ROOT}/{week}/{folder}"
-    client = _client()
-
-    try:
-        entries = list(client.files.list_directory_contents(path))
-    except Exception as exc:
-        # 404 because the most likely cause is a week/folder that doesn't exist yet.
-        raise HTTPException(status_code=404, detail=str(exc))
-
-    files = [
-        {
-            "name": (e.path or "").rstrip("/").split("/")[-1],
-            "path": e.path,
-            "size_bytes": e.file_size,
-            # last_modified comes back as epoch milliseconds from the SDK.
-            "last_modified": (
-                datetime.fromtimestamp(e.last_modified / 1000, tz=timezone.utc).isoformat()
-                if e.last_modified else None
+    parts = [p for p in volume_path.split("/") if p]
+    # Expect: Volumes cat sch vol week folder file
+    if len(parts) < 7 or parts[0] != "Volumes":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid curriculum volume path. Expected "
+                "/Volumes/<catalog>/<schema>/<volume>/<week>/<folder>/<file>."
             ),
-        }
-        for e in entries
-        if not e.is_directory   # skip any nested subdirectories
-    ]
-    return {"files": files, "week": week, "folder": folder}
+        )
+
+    catalog, schema, volume = parts[1], parts[2], parts[3]
+    week = parts[4]
+    file_name = parts[-1]
+    return catalog, schema, volume, week, file_name
 
 
-@router.post("/curriculum/weeks/{week}/{folder}/upload")
-async def upload_file(week: str, folder: str, file: UploadFile = File(...)):
+def _volume_folder_to_content_type(volume_path: str) -> str:
     """
-    Upload a file into the specified week/folder in the curriculum volume.
+    Convert the curriculum bronze folder segment to the content_type used in SQL.
 
-    Two-stage validation before we touch the volume:
+    Bronze layout:
+        .../<week>/markdown/<file>.md   -> silver/vector content_type = 'lesson_markdown'
+        .../<week>/pdfs/<file>.pdf      -> silver/vector content_type = 'pdf'
+        .../<week>/quizzes/<file>.json  -> silver/vector content_type = 'quiz'
 
-      1. Folder must be one of the three known subfolders. The route already
-         pins this in the URL, but we still check explicitly so a typo'd path
-         in a curl test produces a clean 400 instead of an internal error
-         later in the chunker.
-
-      2. File extension must match the folder's allowlist
-         (see FOLDER_ALLOWED_EXTENSIONS). PDFs cannot land in markdown/, JSON
-         quizzes cannot land in pdfs/, etc. This guard exists for two reasons:
-           - The silver chunker dispatches on the folder name AND opens the
-             file with assumptions about its format. A misrouted file would
-             not error at upload time but would crash (or silently produce
-             garbage chunks) during the ETL run.
-           - The file-arrival-triggered job watches the entire bronze volume,
-             so a mistake here doesn't fail loudly — it pollutes silver until
-             someone notices and runs reconciliation.
-
-    Uses overwrite=True so re-uploading a corrected version of an existing
-    file replaces it rather than erroring. The filename is taken from the
-    original file — no server-side renaming is applied.
-
-    Returns: { uploaded: str, path: str }
+    This mapping is part of the data contract with the silver chunker notebook.
+    Keeping it centralized avoids duplicating string literals across multiple SQL
+    statements and makes future folder renames explicit.
     """
-    if folder not in WEEK_SUBFOLDERS:
-        raise HTTPException(status_code=400, detail=f"folder must be one of {WEEK_SUBFOLDERS}")
+    parts = [p for p in volume_path.split("/") if p]
+    folder = parts[5] if len(parts) >= 7 else ""
+    mapping = {
+        "markdown": "lesson_markdown",
+        "pdfs": "pdf",
+        "quizzes": "quiz",
+    }
+    content_type = mapping.get(folder)
+    if content_type is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported curriculum folder '{folder}'. "
+                "Expected one of: markdown, pdfs, quizzes."
+            ),
+        )
+    return content_type
 
-    # Extension check is case-insensitive ("Notes.MD" is still markdown).
-    # os.path.splitext returns ("Notes", ".MD"); .lower() normalizes for the
-    # set membership check against the allowlist.
-    filename = file.filename or ""
-    _stem, ext = os.path.splitext(filename)
-    ext = ext.lower()
-    allowed = FOLDER_ALLOWED_EXTENSIONS[folder]
+
+def _delete_bronze_file(volume_path: str) -> None:
+    """Delete the original file from the bronze Unity Catalog volume."""
+    client = _client()
+    try:
+        client.files.delete(volume_path)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete bronze file '{volume_path}': {exc}",
+        ) from exc
+
+
+def _delete_from_table(table_name: str, week: str, file_name: str, content_type: str) -> int:
+    """
+    Delete rows for one source file from a Delta table and return rows affected.
+
+    We first COUNT(*) to drive an accurate success toast in the UI and to make
+    the operation idempotent-ish: if zero rows match, we skip the DELETE rather
+    than issuing a no-op write. This is helpful when bronze existed but the ETL
+    hadn't processed the file yet.
+
+    Matching strategy:
+      * week        — narrows the blast radius to one curriculum week
+      * content_type — distinguishes markdown/pdf/quiz with the same filename
+      * source_file LIKE '%/<file_name>' — robust to full path prefixes stored
+        in the table while still targeting a single file basename
+
+    Escaping:
+      * file_name is escaped via _sql_escape before interpolation.
+      * week/content_type come from controlled path segments, but we still treat
+        them as string literals for consistency.
+    """
+    safe_file = _sql_escape(file_name)
+    safe_week = _sql_escape(week)
+    safe_type = _sql_escape(content_type)
+
+    count_rows = _run_sql(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM {table_name}
+        WHERE week = '{safe_week}'
+          AND content_type = '{safe_type}'
+          AND source_file LIKE '%/{safe_file}'
+        """
+    )
+    rows_to_delete = int(count_rows[0][0] or 0) if count_rows else 0
+
+    if rows_to_delete == 0:
+        return 0
+
+    _execute(
+        f"""
+        DELETE FROM {table_name}
+        WHERE week = '{safe_week}'
+          AND content_type = '{safe_type}'
+          AND source_file LIKE '%/{safe_file}'
+        """
+    )
+    return rows_to_delete
+
+
+def _sync_vector_index() -> None:
+    """
+    Trigger a Delta Sync on the Vector Search index after deleting source rows.
+
+    The index is configured as TRIGGERED, so deletes in VECTOR_TABLE are not
+    reflected until we explicitly sync. This call is best-effort from the API
+    perspective: if it fails, we surface a 500 because the UI promise is that a
+    delete removes the file from semantic search as well, not just from bronze.
+    """
+    try:
+        _vector_client().get_index(index_name=VECTOR_INDEX).sync()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Vector index sync failed for '{VECTOR_INDEX}': {exc}",
+        ) from exc
+
+
+@router.delete("/curriculum/file")
+def delete_curriculum_file(req: DeleteFileRequest):
+    """
+    Delete a curriculum file across the full retrieval stack.
+
+    Steps:
+      1. Delete the original bronze file from the UC volume.
+      2. Delete corresponding chunk rows from the silver table.
+      3. Delete corresponding rows from the vector store Delta table.
+      4. Trigger a sync on the Vector Search index so semantic search reflects
+         the deletion.
+
+    The operation is intentionally ordered "bronze first" because the user action
+    is fundamentally a source-of-truth delete. If a downstream cleanup step
+    fails, we return a 500 with a precise message so the admin knows manual
+    remediation may be needed.
+    """
+    catalog, schema, volume, week, file_name = _parse_volume_path(req.path)
+    content_type = _volume_folder_to_content_type(req.path)
+
+    # Enforce that callers can only delete from the configured curriculum root.
+    expected_prefix = f"/Volumes/{catalog}/{schema}/{volume}"
+    if not req.path.startswith(expected_prefix):
+        raise HTTPException(status_code=400, detail="Invalid volume path")
+
+    _delete_bronze_file(req.path)
+
+    try:
+        silver_rows = _delete_from_table(SILVER_TABLE, week, file_name, content_type)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Bronze deleted but silver cleanup failed for '{file_name}': "
+                f"{exc.detail}"
+            ),
+        ) from exc
+
+    try:
+        vector_rows = _delete_from_table(VECTOR_TABLE, week, file_name, content_type)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Bronze/silver deleted but vector-table cleanup failed for "
+                f"'{file_name}': {exc.detail}"
+            ),
+        ) from exc
+
+    try:
+        _sync_vector_index()
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Data rows deleted for '{file_name}' but vector index sync failed: "
+                f"{exc.detail}"
+            ),
+        ) from exc
+
+    return {
+        "deleted": True,
+        "silver_rows": silver_rows,
+        "vector_rows": vector_rows,
+        "index_sync_triggered": True,
+    }
+
+
+# --- ETL run status endpoint -------------------------------------------------
+# After an upload, the frontend polls this endpoint every few seconds to show
+# an "ETL running / succeeded / failed" toast. The upload endpoint returns only
+# the run_id because starting the job is fast; reading the eventual result state
+# requires separate polling against the Jobs API.
+
+@router.get("/curriculum/etl-run/{run_id}")
+def get_etl_run(run_id: int):
+    """
+    Return the status of a curriculum ETL Lakeflow Job run.
+
+    Response shape is intentionally frontend-friendly and stable — the React
+    hook shouldn't need to know the Databricks SDK object model or enum names.
+
+    Fields:
+      run_id            — numeric Databricks run ID
+      life_cycle_state  — e.g. PENDING / RUNNING / TERMINATED
+      result_state      — e.g. SUCCESS / FAILED / TIMEDOUT / CANCELED / None
+      state_message     — human-readable message from the Jobs API
+      is_terminal       — convenience boolean for polling stop condition
+      run_page_url      — deep link into the Databricks UI when available
+    """
+    client = _client()
+    try:
+        run = client.jobs.get_run(run_id=run_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch ETL run {run_id}: {exc}",
+        ) from exc
+
+    state = run.state
+    life_cycle = str(state.life_cycle_state) if state and state.life_cycle_state else None
+    result_state = str(state.result_state) if state and state.result_state else None
+    message = state.state_message if state and state.state_message else None
+
+    # Terminal means the UI can stop polling. Jobs uses TERMINATED for both
+    # success and failure, and can also end as SKIPPED / INTERNAL_ERROR for some
+    # failure modes depending on task setup.
+    terminal_life_cycles = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+    is_terminal = (life_cycle or "") in terminal_life_cycles
+
+    return {
+        "run_id": run_id,
+        "life_cycle_state": life_cycle,
+        "result_state": result_state,
+        "state_message": message,
+        "is_terminal": is_terminal,
+        "run_page_url": run.run_page_url,
+    }
+
+
+# --- Upload endpoint helpers -------------------------------------------------
+
+def _derive_extension(file_name: str) -> str:
+    """Return the lowercase file extension including the leading dot."""
+    _, dot, ext = file_name.rpartition(".")
+    return f".{ext.lower()}" if dot else ""
+
+
+def _validate_upload_target(folder_name: str, upload_file_name: str) -> None:
+    """
+    Enforce that uploaded files match the allowed extensions for the folder.
+
+    This catches mistakes early in the admin UI and keeps the bronze layout
+    consistent with downstream assumptions in the chunker / parser jobs.
+    """
+    allowed = FOLDER_ALLOWED_EXTENSIONS.get(folder_name)
+    if allowed is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported folder: {folder_name}")
+
+    ext = _derive_extension(upload_file_name)
     if ext not in allowed:
-        # Sorted for stable error messages — useful both for tests and for
-        # admins reading the toast in the UI.
         allowed_str = ", ".join(sorted(allowed))
         raise HTTPException(
             status_code=400,
             detail=(
-                f"File '{filename}' has extension '{ext or '(none)'}', "
-                f"which is not allowed in {folder}/. "
-                f"Allowed extensions for this folder: {allowed_str}."
+                f"Invalid file type for folder '{folder_name}'. "
+                f"Allowed: {allowed_str}. Got: {ext or 'no extension'}"
             ),
         )
 
-    content = await file.read()
-    path = f"{VOLUME_ROOT}/{week}/{folder}/{filename}"
 
+def _workspace_host() -> str:
+    """
+    Return a normalized workspace host without a trailing slash.
+
+    Used only for constructing deep links back to Databricks Jobs UI. We strip
+    the trailing slash so concatenations like f"{host}/jobs/..." don't produce
+    a double slash.
+    """
+    return os.environ["DATABRICKS_HOST"].rstrip("/")
+
+
+def _start_etl_run_for_upload(week_name: str, folder_name: str, volume_path: str) -> tuple[int | None, str | None]:
+    """
+    Kick off the curriculum ETL job after a successful bronze upload.
+
+    Returns:
+      (run_id, run_page_url) on success
+      (None, None) if the job couldn't be started for a known/handled reason
+
+    Why best-effort instead of hard-failing the upload?
+      The file is already durably written to bronze at this point. Even if the
+      ETL trigger fails, the scheduled / file-arrival job path can still pick it
+      up later, so it's better UX to report a successful upload and let the UI
+      show "ETL not started" than to tell the user the whole action failed.
+
+    Parameters are passed to the job to make the notebook/task future-proof even
+    though the current job may not yet consume them all. They also appear in the
+    run details UI, which is useful when debugging uploads.
+    """
     client = _client()
     try:
-        client.files.upload(file_path=path, contents=io.BytesIO(content), overwrite=True)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        job_id = _get_etl_job_id()
+        run = client.jobs.run_now(
+            job_id=job_id,
+            job_parameters={
+                "week_name": week_name,
+                "folder_name": folder_name,
+                "volume_path": volume_path,
+            },
+        )
+    except HTTPException:
+        # _get_etl_job_id() may raise a structured HTTPException — preserve it
+        # for the caller to log/handle as a best-effort failure.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Reset the cached job id if the run_now call itself fails — the most
+        # common reason is that the bundle was re-deployed and the old job ID is
+        # stale. Next upload will force a re-discovery.
+        global _etl_job_id
+        _etl_job_id = None
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start curriculum ETL job: {exc}",
+        ) from exc
 
-    # ── Fire the ETL job directly via jobs.run_now() ─────────────────────────
-    # The file_arrival trigger on the bronze volume still exists as a safety
-    # net (see resources/curriculum_etl.yml), but its debounce is set to
-    # 300s — too slow for UI feedback. We know the moment a file lands
-    # because we just performed the upload, so we trigger the job
-    # immediately. Cold-start latency on serverless is ~5-15s; warm is 1-3s.
-    #
-    # If anything goes wrong here we still report success on the upload
-    # itself — the file is in bronze, the file_arrival trigger will catch
-    # it within 5 minutes as a fallback, and an admin can manually trigger
-    # the job in the meantime. The etl_run_id/url fields just stay null in
-    # that case so the UI knows there's no run to poll.
+    run_id = getattr(run, "run_id", None)
+    if run_id is None:
+        return None, None
+
+    return run_id, f"{_workspace_host()}/jobs/{job_id}/runs/{run_id}"
+
+
+@router.post("/curriculum/weeks/{week_name}/{folder_name}/upload")
+def upload_file_to_folder(week_name: str, folder_name: str, file: UploadFile = File(...)):
+    client = _client()
+    target_dir = f"{_week_path(week_name)}/{folder_name}"
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    _validate_upload_target(folder_name, file.filename)
+    target_path = f"{target_dir}/{file.filename}"
+
+    try:
+        data = file.file.read()
+        client.files.upload(
+            target_path,
+            io.BytesIO(data),
+            overwrite=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
+    finally:
+        try:
+            file.file.close()
+        except Exception:
+            pass
+
     etl_run_id: int | None = None
     etl_run_url: str | None = None
     try:
-        job_id = _get_etl_job_id()
-        # run_now returns a Run object with run_id; we capture it so the UI
-        # can poll the /etl-run/{run_id} endpoint without round-tripping the
-        # entire job's recent-runs list.
-        run = client.jobs.run_now(job_id=job_id)
-        if run.run_id is not None:
-            etl_run_id = run.run_id
-            host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
-            etl_run_url = f"{host}/#job/{job_id}/run/{run.run_id}" if host else None
+        etl_run_id, etl_run_url = _start_etl_run_for_upload(
+            week_name=week_name,
+            folder_name=folder_name,
+            volume_path=target_path,
+        )
     except HTTPException as exc:
-        # Already an HTTPException — log the detail and keep the upload OK.
-        logger.warning("Could not start ETL run after upload: %s", exc.detail)
-    except Exception as exc:
-        logger.warning("Could not start ETL run after upload: %s", exc)
-        # Reset the cached job ID — if run_now failed because the cached ID
-        # is stale (job redeployed/recreated), next call will re-resolve.
-        global _etl_job_id
-        _etl_job_id = None
+        # Best-effort only — keep the upload successful, but log the failure so
+        # operators can diagnose why the ETL trigger didn't fire.
+        logger.warning(
+            "Upload succeeded but ETL trigger failed for %s: %s",
+            target_path,
+            exc.detail,
+        )
 
     return {
-        "uploaded": filename,
-        "path": path,
+        "uploaded": True,
+        "path": target_path,
         "etl_run_id": etl_run_id,
         "etl_run_url": etl_run_url,
     }
 
 
-# ── ETL run status (for UI polling) ───────────────────────────────────────────
-
-@router.get("/curriculum/etl-run/{run_id}")
-def get_etl_run(run_id: int):
-    """
-    Return a UI-friendly snapshot of an ETL job run.
-
-    Called every few seconds by the admin curriculum page after an upload to
-    drive the "ETL running / done / failed" toast. The shape is deliberately
-    flatter than the raw `Run` SDK object — the UI only cares about whether
-    we've reached a terminal state, what to show in the toast, and where to
-    link if the admin wants to see the DAG in Databricks.
-
-    `is_terminal` is the signal the UI uses to stop polling. The Databricks
-    Jobs API uses two coupled fields:
-      - life_cycle_state: PENDING / RUNNING / TERMINATING / TERMINATED /
-                          SKIPPED / INTERNAL_ERROR
-      - result_state:     SUCCESS / FAILED / TIMEDOUT / CANCELED (only set
-                          when the life cycle is terminal)
-    A run is "done" iff life_cycle_state ∈ {TERMINATED, SKIPPED, INTERNAL_ERROR}.
-
-    Returns:
-        {
-          run_id: int,
-          life_cycle_state: str | None,
-          result_state: str | None,
-          state_message: str,        # short human-readable status from the API
-          is_terminal: bool,
-          run_page_url: str | None,  # deep link into Databricks Jobs UI
-        }
-    """
-    client = _client()
-    try:
-        run = client.jobs.get_run(run_id=run_id)
-    except Exception as exc:
-        # Most likely a 404 (run was deleted, or a typo'd ID) — propagate as
-        # 404 so the UI knows to stop polling rather than retry forever.
-        raise HTTPException(status_code=404, detail=str(exc))
-
-    state = run.state
-    lcs = state.life_cycle_state.value if state and state.life_cycle_state else None
-    rs  = state.result_state.value if state and state.result_state else None
-    msg = (state.state_message if state else None) or ""
-
-    is_terminal = lcs in {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
-
-    return {
-        "run_id":           run.run_id,
-        "life_cycle_state": lcs,
-        "result_state":     rs,
-        "state_message":    msg,
-        "is_terminal":      is_terminal,
-        "run_page_url":     run.run_page_url,
-    }
-
-
-class DeleteFileRequest(BaseModel):
-    path: str
-
-
-def _parse_volume_path(path: str) -> tuple[str, str, str]:
-    """
-    Split a bronze volume path into (week, folder, filename).
-
-    Example:
-        /Volumes/capstone/bronze_layer/curriculum_raw/week_01/markdown/intro.md
-        -> ("week_01", "markdown", "intro.md")
-
-    Falls back to empty strings for any segment we can't identify so the caller
-    can decide whether the fallback path is usable. Specifically, the vector
-    cleanup fallback in delete_file() needs BOTH `week` and `filename` to
-    disambiguate (two weeks can both contain a file named `intro.md`); when
-    either is empty, the fallback is skipped rather than over-deleting.
-
-    Note: we intentionally do not use pathlib.Path here because the volume
-    path is a stable, forward-slash UC path — not the local filesystem — and
-    Path() would normalize/lose information on Windows runtimes.
-    """
-    # Strip the well-known volume root prefix so the remaining parts are
-    # exactly [week, folder, filename] in the standard curriculum layout.
-    rel = path[len(VOLUME_ROOT):].lstrip("/")
-    parts = rel.split("/")
-    week     = parts[0]  if len(parts) > 0 else ""
-    folder   = parts[1]  if len(parts) > 1 else ""
-    filename = parts[-1] if parts            else ""
-    return week, folder, filename
-
-
-def _trigger_index_sync() -> bool:
-    """
-    Fire the vector index sync in a background thread (fire-and-forget).
-
-    Why this isn't inline in the request handler:
-      - The vector search index is configured as a TRIGGERED Delta Sync index
-        (see "Capstone to Vector DB Sync.ipynb"). It doesn't auto-pull CDC
-        changes from the source Delta table — we have to call .sync() to kick
-        an incremental update.
-      - Sync latency for a small change is typically 20-60s, occasionally
-        longer if the index is warming up. Blocking the HTTP response on it
-        would mean the admin UI sits on a spinner for a minute every delete,
-        even though the bronze file is already gone and the silver/vector
-        deltas are already committed.
-      - From the user's perspective, the file disappears from the file list
-        the moment this function returns. The retrieval layer might briefly
-        still surface the deleted chunks (worst case: until the next sync
-        completes), which is acceptable for this hackathon and can be tightened
-        later with a wait-for-sync flag if needed.
-
-    Failures inside the background thread are logged but don't surface to the
-    user — the silver/vector tables are already cleaned, so the deleted chunks
-    won't come back. A failed sync just means the embedded copies stick around
-    until the next successful sync (or the next manual trigger).
-
-    Returns True if the background thread was successfully dispatched, False
-    if we couldn't even start the thread (extremely rare — would indicate an
-    OS resource exhaustion).
-    """
-    def _run():
-        # This runs off the request thread, so any exception here must NOT be
-        # allowed to propagate (it would crash silently in a background worker
-        # and leave no trace beyond stderr). Log + swallow.
-        try:
-            index = _vector_client().get_index(
-                endpoint_name=VECTOR_ENDPOINT,
-                index_name=VECTOR_INDEX,
-            )
-            index.sync()
-        except Exception as exc:
-            logger.warning("Vector index sync failed: %s", exc)
-
-    try:
-        # daemon=True so the thread doesn't keep the process alive at shutdown.
-        # A delete cascade is recoverable on the next sync, so we'd rather drop
-        # an in-flight sync than block process exit.
-        threading.Thread(target=_run, daemon=True).start()
-        return True
-    except Exception as exc:
-        logger.warning("Could not dispatch vector index sync: %s", exc)
-        return False
-
-
-@router.delete("/curriculum/file")
-def delete_file(body: DeleteFileRequest):
-    """
-    Cascade-delete a curriculum file across all four data layers.
-
-    Layer order and the reasoning behind each step:
-
-      1. Silver lookup — fetch the chunk_ids that belong to this file BEFORE
-                         touching anything. If the silver DELETE in step 3
-                         raced with another writer (e.g. a re-ingest job),
-                         we'd lose the ids needed to drive the vector
-                         cleanup in step 4. Looking up first decouples the
-                         vector cleanup from the silver delete order.
-      2. Bronze       — remove the raw file from the UC volume. Doing this
-                         second (not first) means a SQL warehouse outage
-                         won't leave the bronze gone but silver/vector
-                         intact. The UI's "deleting" toast already shows
-                         intent, and re-clicking remove on an in-flight or
-                         partially-failed delete is idempotent (see the
-                         NOT_FOUND handling below).
-      3. Silver       — DELETE rows by source_path. Using full path (not
-                         filename) handles the case where two weeks both
-                         contain a file with the same name.
-      4. Vector store — DELETE rows from the vector source Delta table by
-                         id IN (...). Falls back to a JSON metadata match
-                         on (source_file, week) if silver returned no
-                         chunk_ids — covers the edge case where silver was
-                         rebuilt or never populated, but the vector table
-                         still holds the orphaned chunks.
-      5. Semantic     — Fire .sync() on the TRIGGERED Delta Sync index in a
-                         background thread. CDC on the vector source table
-                         drives the actual delete on the embedded copy.
-
-    Idempotency: re-clicking remove on a file that's already partially gone
-    is safe. NOT_FOUND on bronze is treated as success; silver/vector DELETEs
-    on already-empty result sets are no-ops at the SQL level.
-
-    Security: the path is validated against VOLUME_ROOT to prevent the
-    endpoint from being weaponized to delete files elsewhere in UC. The SQL
-    interpolation is hardened with _sql_escape() against apostrophe-containing
-    filenames (see the helper's docstring for why we're not parameterizing yet).
-
-    Returns:
-        {
-          deleted: str,               # echo of the input path
-          silver_rows: int,           # how many chunk rows were on this file
-          vector_rows: int,           # how many vector_store rows were deleted
-                                      # (0 if the fallback path ran — see below)
-          index_sync_triggered: bool, # whether the background sync dispatched
-        }
-    """
-    # ── Guard rail: never let this endpoint touch paths outside the curriculum
-    # volume. The bronze workspace contains other UC objects (logging tables,
-    # checkpoints, etc.) that an admin should NOT be able to nuke via a curl
-    # against this endpoint.
-    if not body.path.startswith(VOLUME_ROOT):
-        raise HTTPException(status_code=400, detail="Path is outside the curriculum volume")
-
-    # Bind locals up-front so every step below has consistent inputs and the
-    # SQL-safe literal isn't recomputed each time.
-    path     = body.path
-    path_lit = _sql_escape(path)
-    week, _folder, filename = _parse_volume_path(path)
-
-    # ── Step 1: collect chunk_ids from silver before deleting anything ────────
-    # The vector_store rows are keyed by chunk_id (= silver's chunk_id), so we
-    # need this list to drive the vector DELETE in step 4. Two reasons we do
-    # the SELECT before the DELETE rather than relying on a single statement:
-    #   - The Databricks SQL DELETE doesn't return the affected row keys, only
-    #     a count. We need the actual ids.
-    #   - Capturing the ids first means a concurrent re-ingest writer can't
-    #     race us into a state where silver is half-empty by the time we read.
-    # A SELECT failure here is recoverable: we fall back to the filename+week
-    # JSON match in step 4, so silver being temporarily unreachable doesn't
-    # block the rest of the cascade.
-    try:
-        chunk_rows = _run_sql(
-            f"SELECT chunk_id FROM {SILVER_TABLE} WHERE source_path = '{path_lit}'"
-        )
-    except HTTPException:
-        chunk_rows = []
-    chunk_ids = [r[0] for r in chunk_rows if r and r[0]]
-
-    # ── Step 2: delete bronze file ───────────────────────────────────────────
-    # This is the only step the user-facing UI directly observes (the file
-    # row vanishes from the listing). A failure here aborts the cascade so we
-    # don't leave silver/vector half-cleaned for a file the admin can still
-    # see — they'd have no UI affordance to retry against the missing bronze.
-    #
-    # NOT_FOUND is the deliberate exception: re-clicking "remove" on a file
-    # whose bronze copy is already gone (e.g. a previous cascade succeeded on
-    # bronze/silver but failed on vector) should still finish cleaning up the
-    # downstream layers.
-    client = _client()
-    try:
-        client.files.delete(path)
-    except Exception as exc:
-        msg = str(exc).lower()
-        # The SDK doesn't expose a typed NOT_FOUND exception, so we sniff the
-        # message. Three known surfaces: REST 404, "FILE_NOT_FOUND" error code,
-        # "not found" phrasing. Match all three to be defensive.
-        if "not_found" not in msg and "not found" not in msg and "404" not in msg:
-            raise HTTPException(status_code=500, detail=f"Bronze delete failed: {exc}")
-
-    # ── Step 3: delete silver rows ───────────────────────────────────────────
-    # We already know the row count from step 1, so we can report silver_rows
-    # without doing a follow-up COUNT(*). A DELETE failure here is the worst
-    # cascade state to be in: bronze is gone but silver still holds chunks
-    # that reference a missing source file. We surface that explicitly in the
-    # error detail so the admin knows reconciliation is needed.
-    silver_rows = 0
-    try:
-        _execute(f"DELETE FROM {SILVER_TABLE} WHERE source_path = '{path_lit}'")
-        silver_rows = len(chunk_ids)
-    except HTTPException as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Bronze deleted but silver cleanup failed: {exc.detail}",
-        )
-
-    # ── Step 4: delete vector store rows ─────────────────────────────────────
-    # Two paths:
-    #   - Primary: we have chunk_ids from silver, so we can do a precise
-    #     `id IN (...)` delete. This is the common case and lets us report
-    #     an accurate vector_rows count.
-    #   - Fallback: silver returned nothing (either step 1 errored, or the
-    #     silver table has no rows for this path even though the vector
-    #     table does — a real possibility if silver was rebuilt without
-    #     re-running the vector sync notebook). We match on the JSON
-    #     metadata fields the sync notebook packs into each vector row.
-    #     vector_rows stays 0 because we'd need a separate SELECT to know
-    #     how many were actually affected — the index sync in step 5 will
-    #     reconcile regardless.
-    vector_rows = 0
-    try:
-        if chunk_ids:
-            # Quote each id individually so the IN-list is bulletproof against
-            # any id containing characters that happen to confuse SQL parsing.
-            id_list = ", ".join(f"'{_sql_escape(cid)}'" for cid in chunk_ids)
-            _execute(f"DELETE FROM {VECTOR_TABLE} WHERE id IN ({id_list})")
-            vector_rows = len(chunk_ids)
-        elif filename and week:
-            # Fallback only fires when we have BOTH filename and week — that's
-            # the minimum signal needed to disambiguate "intro.md in week_01"
-            # from "intro.md in week_02" without over-deleting.
-            fname_lit = _sql_escape(filename)
-            week_lit  = _sql_escape(week)
-            _execute(
-                f"DELETE FROM {VECTOR_TABLE} "
-                f"WHERE get_json_object(metadata, '$.source_file') = '{fname_lit}' "
-                f"  AND get_json_object(metadata, '$.week') = '{week_lit}'"
-            )
-    except HTTPException as exc:
-        # By this point bronze + silver are already clean. A vector failure
-        # leaves orphaned embeddings that the index sync will keep serving
-        # until manually reconciled, so surface explicitly.
-        raise HTTPException(
-            status_code=500,
-            detail=f"Bronze + silver cleared but vector cleanup failed: {exc.detail}",
-        )
-
-    # ── Step 5: trigger the semantic index sync (fire-and-forget) ────────────
-    # See _trigger_index_sync() for why this runs off-thread and why a failure
-    # here is intentionally non-fatal.
-    index_sync_triggered = _trigger_index_sync()
-
-    return {
-        "deleted": path,
-        "silver_rows": silver_rows,
-        "vector_rows": vector_rows,
-        "index_sync_triggered": index_sync_triggered,
-    }
-
-
-# ── Audit Log ─────────────────────────────────────────────────────────────────
-
-# Audit-page response cache. Same shape as _overview_cache above but keyed by
-# (page, limit, intent) because the audit log paginates and filters — there's
-# no single canonical payload to cache.
-#
-# Why a cache at all: this endpoint is hit on every admin "Audit Log" page
-# load, on every page-change click, and on every intent-filter change. Each
-# call round-trips Databricks at least once (see the SQL below). At ~1-3s
-# of unavoidable Statement Execution API overhead per call, repeated clicks
-# add up fast. Caching for 30s makes refresh / page-flip / re-filter feel
-# instant for the common pattern of an admin browsing recent activity.
-#
-# Why 30s (vs the 60s on _overview_cache): the audit log is the page admins
-# stare at when chat traffic is happening in real time — they want new rows
-# to show up promptly. 30s is the longest delay that still feels responsive
-# for a "what's happening right now" view.
-#
-# Why no eviction logic: the keyspace is naturally bounded. Intent has 4
-# possible values (curriculum / answer_seeking / off_topic / ""), pages are
-# typically in the single digits even for a busy week, and limit is a UI
-# constant. Worst case the dict holds O(tens) of entries, each ~50 rows ×
-# ~2KB = a few MB. Not worth a TTL sweeper.
-_audit_cache: dict[tuple[int, int, str], tuple[float, dict]] = {}
-_AUDIT_TTL = 30.0
-
+# ── Audit Log ────────────────────────────────────────────────────────────────
 
 @router.get("/audit")
-def get_audit_log(page: int = 1, limit: int = 50, intent: str = ""):
-    """
-    Return a paginated, optionally filtered slice of interaction_logs.
-
-    Query params:
-      page   — 1-based page number (default 1)
-      limit  — rows per page (default 50)
-      intent — if provided, filter to rows where intent = this value
-                (valid values: curriculum, answer_seeking, off_topic)
-
-    Returns: { entries: [...], total: int, page: int, limit: int }
-
-    Performance notes:
-      - The previous version fired TWO sequential Statement Execution API
-        calls per request: one for the page rows, one for COUNT(*). Each
-        call carries ~2-6s of Databricks API overhead (HTTP round-trip +
-        statement planning + result manifest fetch) even on a warm
-        warehouse — wall-clock was ~13s for queries that themselves take
-        <50ms against a 210-row table. We collapse both into a single
-        query using COUNT(*) OVER(), which attaches the unfiltered (well,
-        post-WHERE) row total to every result row at negligible cost in
-        the same query plan.
-      - Results are cached for 30s keyed by (page, limit, intent) — see
-        the _audit_cache comment above for the rationale.
-      - When the combined query returns zero rows (admin paged past the
-        end of a filtered set), we lose the window-function output and
-        need to fall back to a one-shot COUNT(*) so the UI still gets an
-        accurate total and can correct itself. This path is rare in
-        normal UI flow (useAuditLog resets page=1 on filter change) so
-        the extra round-trip only fires on a curl typo or a stale URL.
-    """
-    # Cache lookup happens BEFORE building any SQL — a cache hit returns the
-    # exact same object the admin saw on a previous request within the TTL,
-    # which is what we want for repeat clicks / refreshes.
-    cache_key = (page, limit, intent)
-    cached = _audit_cache.get(cache_key)
-    if cached is not None and (time.monotonic() - cached[0]) < _AUDIT_TTL:
-        return cached[1]
-
+def get_audit_log(page: int = 1, limit: int = 50, intent: str | None = None):
     offset = (page - 1) * limit
+    where = f"WHERE intent = '{intent}'" if intent else ""
+    count_sql = f"SELECT COUNT(*) FROM interaction_logs {where}"
+    data_sql = f"""
+      SELECT timestamp, session_id, user_input, intent, attempt
+      FROM interaction_logs
+      {where}
+      ORDER BY timestamp DESC
+      LIMIT {limit} OFFSET {offset}
+    """
+    total_rows = _run_sql(count_sql)
+    data_rows = _run_sql(data_sql)
 
-    # The intent value comes from a constrained dropdown in the UI, but the
-    # endpoint is also reachable via curl/direct HTTP. _sql_escape() keeps
-    # this interpolation consistent with the rest of the file's SQL pattern
-    # until the _execute helper is upgraded to thread parameters through.
-    intent_filter = f"AND intent = '{_sql_escape(intent)}'" if intent else ""
-
-    # Single round-trip: page rows + total count via window function.
-    # COUNT(*) OVER() with no PARTITION BY computes a single value over the
-    # whole filtered result set and repeats it on every row. The window
-    # executes inside the same scan, so the additional cost over a plain
-    # SELECT is essentially free at this table size (210 rows today; would
-    # remain cheap at much higher cardinality because the engine still only
-    # has to evaluate the predicate once).
-    rows = _run_sql(f"""
-        SELECT log_id, session_id, timestamp, user_input, system_output, intent, attempt,
-               COUNT(*) OVER() AS total_count
-        FROM interaction_logs
-        WHERE 1=1 {intent_filter}
-        ORDER BY timestamp DESC
-        LIMIT {limit} OFFSET {offset}
-    """)
-
-    if rows:
-        # COUNT(*) OVER() emits the same total on every row — read it off the
-        # first row. Index 7 is the trailing column we appended to the SELECT.
-        total = int(rows[0][7]) if rows[0][7] is not None else 0
-    else:
-        # Empty page → no row carries the window result. Fall back to a cheap
-        # COUNT(*) so the frontend still receives an accurate total and can
-        # bounce the user back to a valid page. We intentionally do NOT cache
-        # the empty-rows case under a different key — the cache key already
-        # captures (page, limit, intent), so the same empty payload will be
-        # served from cache on retry until TTL expires.
-        count_rows = _run_sql(
-            f"SELECT COUNT(*) FROM interaction_logs WHERE 1=1 {intent_filter}"
-        )
-        total = int(count_rows[0][0]) if count_rows and count_rows[0][0] else 0
-
+    total = int(total_rows[0][0]) if total_rows else 0
     entries = [
         {
-            "log_id":        r[0],
-            "session_id":    r[1],
-            "timestamp":     r[2],
-            "user_input":    r[3],
-            "system_output": r[4],
-            "intent":        r[5],
-            # attempt defaults to 1 if the column is null (older log rows).
-            "attempt":       int(r[6]) if r[6] else 1,
+            "timestamp": r[0],
+            "session_id": r[1],
+            "user_input": r[2],
+            "intent": r[3],
+            "attempt": r[4],
         }
-        for r in rows
+        for r in data_rows
     ]
-
-    payload = {
+    return {
         "entries": entries,
-        "total":   total,
-        "page":    page,
-        "limit":   limit,
+        "total": total,
+        "page": page,
+        "limit": limit,
     }
-    _audit_cache[cache_key] = (time.monotonic(), payload)
-    return payload
