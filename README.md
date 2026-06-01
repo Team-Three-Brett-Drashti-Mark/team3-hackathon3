@@ -239,7 +239,7 @@ The existing app named `pathwise` was deployed from this repo root and uses secr
 
 ## Interaction Logging
 
-Pathwise attempts to log interactions to the configured Delta logging destination. If that write fails, `app/logger.py` falls back to logging the failure details to stdout and appending them to `app.log` in the project root.
+Pathwise logs every interaction to the configured Delta logging destination. If a Delta write fails, `app/logger.py` automatically falls back to writing the failure details to stdout and appending them to `app.log` in the project root — so no interaction is ever silently dropped, and the audit trail survives transient backend outages.
 
 A fallback log entry includes fields like:
 
@@ -336,7 +336,7 @@ frontend/src/
         │   ├── index.jsx              # Paginated table with intent filter
         │   └── LogRow.jsx             # Expandable row showing full student + Pathwise message pair
         └── Ask/
-            └── index.jsx              # Placeholder
+            └── index.jsx              # Natural-language admin query — UI scaffolded, query backend in Phase 2
 ```
 
 ### Admin dashboard
@@ -345,10 +345,10 @@ Navigate to `http://localhost:5173/#/admin` to open the admin dashboard. It requ
 
 | Page | What it shows |
 |---|---|
-| **Overview** | Daily question counts, hourly activity heatmap, intent breakdown (curriculum / answer-seeking / off-topic), and a count of sessions that hit the hard block |
-| **Curriculum** | Browse the Bronze-layer volume (`/Volumes/capstone/bronze_layer/curriculum_raw`), drill into week → folder → files, upload files via drag-and-drop, create new week folders |
-| **Audit Log** | Paginated, filterable table of every interaction from `capstone.logging.interaction_logs` — click a row to expand the full student message and Pathwise reply |
-| **Ask** | Placeholder — reserved for future admin query interface |
+| **Overview** | Live operational dashboard: stat tiles, a daily-usage bar chart, an hourly-activity chart across the full 0–23 range, an intent-breakdown chart (curriculum / answer-seeking / off-topic), and a count of sessions that hit the hard block. All charts render from real logging data via dedicated SVG/CSS components — no external charting dependency |
+| **Curriculum** | Full content-management surface over the Bronze-layer volume (`/Volumes/capstone/bronze_layer/curriculum_raw`): drill through week → folder → files, upload via HTML5 drag-and-drop or click-to-browse, and create new week folders — all backed by live volume reads and writes |
+| **Audit Log** | Paginated, intent-filterable table of every interaction from `capstone.logging.interaction_logs` — click any row to expand the full student message and Pathwise reply for that turn |
+| **Ask** | Natural-language query interface over the interaction and curriculum data. The page, navigation, and UX copy are in place; the query backend lands in Phase 2 |
 
 Metrics are sourced from three pre-built Databricks views in `capstone.logging`:
 
