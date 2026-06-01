@@ -1,4 +1,4 @@
-# Phase 2 Plan (Draft)
+# Phase 2 Plan
 
 ## Major Features Planned
 
@@ -18,7 +18,6 @@ This feature will strengthen the assistant’s ability to guide students while m
 We plan to build a more advanced analytics and monitoring system for instructors and administrators, including:
 
 * At-risk student indicators
-* Struggle heatmaps by topic or assignment
 * Common misconception reports
 * Curriculum usage analytics
 * Instant curriculum update controls
@@ -37,6 +36,7 @@ Phase 2 will heavily improve the usability and overall experience of the platfor
 * Improving dashboard clarity and navigation
 * Adding mobile responsiveness
 * Creating smoother student and instructor workflows
+* Natural language processing for analytics
 
 ### Secondary Focus: Evaluation & Performance
 
