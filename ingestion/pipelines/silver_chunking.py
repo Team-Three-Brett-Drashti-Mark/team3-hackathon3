@@ -16,7 +16,7 @@ script needs to be idempotent against re-runs:
 
 Folder → file format mapping:
     week_XX/markdown/  → .md / .markdown  → context-enriched section chunks
-    week_XX/pdfs/      → .pdf             → currently TODO (skipped)
+    week_XX/pdfs/      → .pdf             → pypdf text extraction → splitter chunks
     week_XX/quizzes/   → .json            → one chunk per quiz question
 
 CLI (all args optional — defaults match the production catalog/schema):
@@ -49,6 +49,12 @@ MARKDOWN_CHUNK_SIZE    = 400
 MARKDOWN_CHUNK_OVERLAP = 50
 QUIZ_CHUNK_SIZE        = 300   # smaller — quiz questions are naturally short
 QUIZ_CHUNK_OVERLAP     = 0     # no overlap — each question is self-contained
+# PDFs get a larger window than markdown: extracted PDF text has no heading
+# structure to split on, so bigger chunks keep related prose together instead
+# of fragmenting mid-thought, and the overlap softens the hard cuts the
+# splitter is forced to make in the absence of natural section boundaries.
+PDF_CHUNK_SIZE         = 600
+PDF_CHUNK_OVERLAP      = 75
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -190,6 +196,114 @@ def chunk_markdown_file(file_path: str) -> list[dict]:
                 "source_reference": None,
                 "ingested_at":      now,
             })
+
+    return chunks
+
+
+def chunk_pdf_file(file_path: str) -> list[dict]:
+    """
+    Read a PDF file and return a list of chunk dicts ready for silver.
+
+    PDFs have no heading structure we can lean on the way markdown does, so the
+    strategy is different: extract every page's text, stitch the pages together
+    with ``[Page N]`` markers (so a chunk that straddles a page boundary still
+    carries a breadcrumb back to the source page), then hand the whole document
+    to the recursive splitter. There's no section-level first pass — the splitter
+    is the only boundary mechanism here.
+
+    Like chunk_markdown_file, the context prefix lives in `page_content` for
+    callers that want hierarchical context, while `raw_content` holds the clean
+    extracted text that the vector store actually embeds.
+
+    Both imports (pypdf, langchain) are local to the function for the same reason
+    the other chunkers keep their heavy deps local: the module must stay
+    importable for unit-test runs on machines without these packages installed.
+
+    Returns an empty list (not an error) when extraction yields no text — that's
+    the expected outcome for scanned/image-only PDFs, which need OCR we don't do
+    here. Swallowing it as "0 chunks" keeps one un-OCR-able file from failing the
+    whole batch; the warning log is the operator's signal to investigate.
+    """
+    from pypdf import PdfReader
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    path_meta = parse_path_metadata(file_path)
+    doc_title = Path(file_path).stem
+    source_file = Path(file_path).name
+
+    reader = PdfReader(file_path)
+
+    # Per-page extraction with explicit page markers. We tag each page so that
+    # when the splitter later carves the joined text into chunks, a chunk can
+    # still be traced back to roughly which page(s) it came from. Pages that
+    # extract to nothing (blank or image-only) are dropped rather than emitting
+    # an empty "[Page N]" header with no body.
+    page_texts: list[str] = []
+    for page_num, page in enumerate(reader.pages, start=1):
+        text = page.extract_text()
+        if text and text.strip():
+            page_texts.append(f"[Page {page_num}]\n{text.strip()}")
+
+    full_text = "\n\n".join(page_texts)
+    if not full_text.strip():
+        # No extractable text — almost always a scanned/image PDF. Not a hard
+        # failure (see docstring); log so an operator can decide whether OCR is
+        # worth adding for this file.
+        logger.warning("No text extracted from %s — skipping (likely scanned/image PDF)", source_file)
+        return []
+
+    # Separators omit the markdown-heading patterns the markdown splitter uses
+    # (there are none in extracted PDF text) and fall through paragraph → line →
+    # sentence → word → character so the splitter always has a legal cut point.
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=PDF_CHUNK_SIZE,
+        chunk_overlap=PDF_CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    raw_chunks = splitter.create_documents([full_text])
+    chunks: list[dict] = []
+    now = datetime.now(timezone.utc)
+    total = len(raw_chunks)
+
+    for i, chunk in enumerate(raw_chunks):
+        context_prefix = (
+            f"Document: {doc_title}\n"
+            f"Content Type: pdf\n"
+            f"Week: {path_meta['week']}\n"
+            f"Chunk {i + 1} of {total}\n"
+            "---\n"
+        )
+        raw_content = chunk.page_content
+        page_content = context_prefix + raw_content
+
+        # Distinct "__pdf__" namespace in the chunk_id keeps these from ever
+        # colliding with markdown ("__<section>__chunk_N") or quiz ("__quiz__")
+        # ids for the same week/doc — important because the MERGE keys on
+        # chunk_id, so a collision would silently overwrite another file's chunk.
+        chunk_id = f"{path_meta['week']}__{doc_title}__pdf__chunk_{i}"
+
+        chunks.append({
+            "chunk_id":         chunk_id,
+            "doc_title":        doc_title,
+            "source_file":      source_file,
+            "source_path":      file_path,
+            "content_type":     "pdf",
+            "week":             path_meta["week"],
+            "topic":            doc_title,
+            "section_title":    "PDF Content",
+            "concept_tags":     None,
+            "chunk_index":      i,
+            "total_chunks":     total,
+            "chunk_strategy":   "pdf_text_extraction",
+            "page_content":     page_content,
+            "raw_content":      raw_content,
+            "difficulty":       None,
+            "quiz_id":          None,
+            "question_id":      None,
+            "source_reference": None,
+            "ingested_at":      now,
+        })
 
     return chunks
 
@@ -442,17 +556,21 @@ def run(spark, catalog: str, bronze_schema: str, silver_schema_name: str,
         all_chunks.extend(file_chunks)
         logger.info("  ✓ %s → %d chunks", Path(path).name, len(file_chunks))
 
-    # PDFs are intentionally skipped. The original notebook stubbed extraction
-    # as a TODO; pulling in a PDF parser (pypdf / unstructured / OCR) is a
-    # follow-up. For now we just log discovery so an operator knows files are
-    # being seen but not yet processed.
+    # ── Discover and chunk PDFs ─────────────────────────────────────────────
+    # Mirrors the markdown/quiz loops: per-file try/except so one un-parseable
+    # PDF (corrupt, encrypted, exotic encoding) gets logged and skipped instead
+    # of aborting the batch. Note chunk_pdf_file also returns [] for scanned
+    # image-only PDFs — those land here as "0 chunks", which is intentional.
     pdf_files = _list_files_under(volume_root, "pdfs", (".pdf",))
-    if pdf_files:
-        logger.warning(
-            "Skipping %d PDF file(s) — PDF extraction is not yet implemented "
-            "(see TODO in this module).",
-            len(pdf_files),
-        )
+    logger.info("Found %d PDF file(s)", len(pdf_files))
+    for path in pdf_files:
+        try:
+            file_chunks = chunk_pdf_file(path)
+        except Exception as exc:
+            logger.exception("Failed to chunk PDF %s: %s", path, exc)
+            continue
+        all_chunks.extend(file_chunks)
+        logger.info("  ✓ %s → %d chunks", Path(path).name, len(file_chunks))
 
     if not all_chunks:
         # No work to do isn't a failure — the trigger may have fired for a
