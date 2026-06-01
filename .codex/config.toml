@@ -1,0 +1,4 @@
+﻿
+[mcp_servers.databricks]
+command = "C:/Users/marky/.ai-dev-kit/.venv/Scripts/python.exe"
+args = ["C:/Users/marky/.ai-dev-kit/repo/databricks-mcp-server/run_server.py"]
