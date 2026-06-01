@@ -74,6 +74,11 @@ resources:
               # Pinned to match the original notebook so chunk_ids stay
               # stable across the ipynb → .py migration.
               - "langchain-text-splitters==1.1.1"
+              # pypdf powers chunk_pdf_file's text extraction. Pinned to the
+              # version the PDF chunking was validated against — a major bump
+              # can change extracted text (whitespace/layout heuristics), which
+              # would reshuffle PDF chunk boundaries and force a re-embed.
+              - "pypdf==5.1.0"
         - environment_key: vector_env
           spec:
             client: "2"
