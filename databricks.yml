@@ -1,3 +1,4 @@
+
 # =============================================================================
 # Pathwise / team3-hackathon3 — Databricks Asset Bundle
 # =============================================================================
@@ -33,7 +34,7 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://dbc-05589632-7e63.cloud.databricks.com
+      host: https://dbc-7bb5bcef-a4bc.cloud.databricks.com/
 
   # Production target stub. Switch the host (and ideally use a service
   # principal profile here) when we're ready for a real prod deploy.
@@ -41,4 +42,4 @@ targets:
   # prod:
   #   mode: production
   #   workspace:
-  #     host: https://dbc-05589632-7e63.cloud.databricks.com
+  #     host: https://dbc-7bb5bcef-a4bc.cloud.databricks.com/

@@ -60,12 +60,16 @@ export function useChat(currentQuestion) {
         ...prev,
         { role: "hint", text: data.response_text, intent: data.intent },
       ]);
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : "Unknown chat error.";
+
       setChat((prev) => [
         ...prev,
         {
           role: "hint",
-          text: "Could not reach the Pathwise backend. Make sure the API server is running on port 8000.",
+          text: `Pathwise chat failed: ${message}`,
           intent: "error",
         },
       ]);

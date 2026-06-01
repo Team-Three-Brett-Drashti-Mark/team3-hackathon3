@@ -2,12 +2,15 @@ import React from "react";
 import { colors } from "../../../student/styles/theme";
 
 const W = 520, H = 160;
-const PAD = { top: 10, right: 16, bottom: 36, left: 36 };
+// top padding leaves headroom for the count label drawn above each bar — the
+// tallest bar reaches y = PAD.top, and its label sits ~14px above that, so
+// without enough headroom (e.g. counts of 30+) the label clips off the top.
+const PAD = { top: 24, right: 16, bottom: 36, left: 36 };
 const CHART_W = W - PAD.left - PAD.right;
 const CHART_H = H - PAD.top - PAD.bottom;
 
-// Inline SVG bar chart showing question counts for the past 7 days.
-// No chart library dependency — keeps the bundle small.
+// Inline SVG bar chart showing daily question counts (the caller passes the
+// most recent 10 days). No chart library dependency — keeps the bundle small.
 export default function DailyUsageChart({ data = [] }) {
   if (!data.length) {
     return (
