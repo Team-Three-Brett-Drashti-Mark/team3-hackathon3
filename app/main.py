@@ -37,6 +37,15 @@ class PathwiseState(TypedDict):
 # Classifier & Router Nodes
 # =============================================================================
 
+# Minimum vector-search relevance score a chunk must clear to count as real
+# grounding. Calibrated against the live index: genuine in-corpus hits score
+# ~0.66–0.76 while out-of-corpus nearest-neighbors top out around ~0.56, so 0.60
+# sits cleanly in the gap. Below this we treat the question as having NO
+# curriculum match and return nothing, rather than feeding the LLM an irrelevant
+# chunk it will fabricate a citation around. Tune up if hallucinated grounding
+# persists, down if legitimate questions start coming back ungrounded.
+MIN_RELEVANCE_SCORE = 0.60
+
 _ANSWER_SEEKING_KEYWORDS = [
     "what is the answer", "give me the answer", "just tell me",
     "what's the solution", "what is the solution", "solve this for me",
@@ -106,6 +115,15 @@ def retrieve_context(state: PathwiseState) -> dict:
     if prior_assistant:
         query = f"{prior_assistant}\n{query}"
     chunks = retrieve(query, k=3)
+
+    # Relevance gate (vector-search score). The index always returns k nearest
+    # neighbors, even when the student asks about something not in the corpus
+    # (e.g. recursion while only week_01 strings is loaded) — those come back at
+    # a low score. Dropping sub-threshold chunks here means an out-of-corpus
+    # question yields no grounding at all, so the response nodes answer honestly
+    # instead of inventing a curriculum citation. This runs BEFORE the keyword
+    # filter below so weak matches can't be resurrected as the "best" chunk.
+    chunks = [c for c in chunks if (c.get("score") or 0) >= MIN_RELEVANCE_SCORE]
 
     # Filter out chunks that are off-topic relative to the student's own messages.
     # Without this, a RAG query seeded with a long assistant explanation can pull
