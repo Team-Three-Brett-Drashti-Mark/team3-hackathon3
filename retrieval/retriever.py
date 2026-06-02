@@ -1,9 +1,31 @@
 import json
+import os
 import re
 import logging
 from databricks.sdk import WorkspaceClient
 
 logger = logging.getLogger(__name__)
+
+
+def _workspace_client() -> WorkspaceClient:
+    """Build a WorkspaceClient that works both in a Databricks App and locally.
+
+    In a Databricks App the runtime injects BOTH a PAT (DATABRICKS_TOKEN) and the
+    app service principal's OAuth creds (DATABRICKS_CLIENT_ID/SECRET). With both
+    present the SDK refuses to choose — it raises "validate: more than one
+    authorization method configured: oauth and pat" — and EVERY query_index call
+    throws. Because retrieve() swallows that exception and returns [], the
+    deployed app silently lost all curriculum grounding. Pinning auth_type="pat"
+    resolves the ambiguity, matching how app/admin.py builds its client.
+
+    Locally (and in unit tests) there's no DATABRICKS_TOKEN, so we fall back to
+    the default SDK credential chain, letting a ~/.databrickscfg profile work.
+    """
+    host = os.environ.get("DATABRICKS_HOST")
+    token = os.environ.get("DATABRICKS_TOKEN")
+    if host and token:
+        return WorkspaceClient(host=host, token=token, auth_type="pat")
+    return WorkspaceClient()
 
 _INDEX_NAME = "capstone.vector_layer.curriculum_semantic_index"
 
@@ -86,7 +108,7 @@ def retrieve(query: str, k: int = 3) -> list[dict]:
     retrieved context. Check logs for auth or network errors.
     """
     try:
-        w = WorkspaceClient()
+        w = _workspace_client()
         results = w.vector_search_indexes.query_index(
             index_name=_INDEX_NAME,
             query_text=query,

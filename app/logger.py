@@ -30,9 +30,16 @@ def _escape(s: str) -> str:
 def _write_to_delta(session_id: str, user_input: str, system_output: str,
                     intent: str, attempt: int) -> None:
     try:
+        # auth_type="pat" is REQUIRED in the Databricks App runtime: it injects
+        # both a PAT (DATABRICKS_TOKEN) and the app SP's OAuth creds
+        # (DATABRICKS_CLIENT_ID/SECRET), and without pinning one the SDK raises
+        # "validate: more than one authorization method configured: oauth and
+        # pat" — which made every Delta log write fail and silently fall back to
+        # app.log, so nothing landed in interaction_logs. Matches app/admin.py.
         client = WorkspaceClient(
             host=os.environ["DATABRICKS_HOST"],
             token=os.environ["DATABRICKS_TOKEN"],
+            auth_type="pat",
         )
         sql = _INSERT_SQL.format(
             log_id=str(uuid.uuid4()),
