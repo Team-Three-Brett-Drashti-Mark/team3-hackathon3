@@ -599,7 +599,7 @@ def _delete_bronze_file(volume_path: str) -> None:
         ) from exc
 
 
-def _delete_from_table(table_name: str, week: str, file_name: str, content_type: str) -> int:
+def _delete_from_table(table_name: str, week: str, file_name: str, *, json_metadata: bool = False) -> int:
     """
     Delete rows for one source file from a Delta table and return rows affected.
 
@@ -608,43 +608,46 @@ def _delete_from_table(table_name: str, week: str, file_name: str, content_type:
     than issuing a no-op write. This is helpful when bronze existed but the ETL
     hadn't processed the file yet.
 
-    Matching strategy:
-      * week        — narrows the blast radius to one curriculum week
-      * content_type — distinguishes markdown/pdf/quiz with the same filename
-      * source_file LIKE '%/<file_name>' — robust to full path prefixes stored
-        in the table while still targeting a single file basename
+    Matching strategy — (week, source_file):
+      A (week, source_file) pair uniquely identifies one file's chunks. The
+      three bronze folders take different extensions (markdown=.md, pdfs=.pdf,
+      quizzes=.json), so the same basename can never collide across content
+      types within a week. We match source_file by EXACT basename because both
+      tables store the bare filename (e.g. "intro_to_strings.md"), not a path —
+      the old `LIKE '%/<file>'` pattern required a slash and so matched nothing.
 
-    Escaping:
-      * file_name is escaped via _sql_escape before interpolation.
-      * week/content_type come from controlled path segments, but we still treat
-        them as string literals for consistency.
+      We deliberately do NOT filter on content_type. Silver stores the raw
+      values 'markdown'/'pdf'/'quiz', which never matched the admin folder
+      mapping ('lesson_markdown'/...), so an earlier version of this predicate
+      silently matched zero rows on silver and left chunks orphaned.
+
+    Schema difference between the two cascade targets — the `json_metadata` flag:
+      * SILVER_TABLE stores week/source_file as top-level columns.
+      * VECTOR_TABLE (capstone_vector_store) stores them INSIDE a JSON string
+        `metadata` column — its real columns are (id, text, metadata,
+        created_at). So week/source_file are reached via the `metadata:field`
+        semi-structured accessor, not as bare columns. This is exactly why the
+        old code failed with UNRESOLVED_COLUMN `week` against the vector table:
+        it assumed flat columns that have never existed there.
+
+    Escaping: file_name and week are escaped via _sql_escape before interpolation.
     """
     safe_file = _sql_escape(file_name)
     safe_week = _sql_escape(week)
-    safe_type = _sql_escape(content_type)
 
-    count_rows = _run_sql(
-        f"""
-        SELECT COUNT(*) AS n
-        FROM {table_name}
-        WHERE week = '{safe_week}'
-          AND content_type = '{safe_type}'
-          AND source_file LIKE '%/{safe_file}'
-        """
-    )
+    # Pick the column accessors for this table's shape: bare columns for the
+    # silver table, JSON-path accessors for the vector store's metadata blob.
+    week_col = "metadata:week" if json_metadata else "week"
+    file_col = "metadata:source_file" if json_metadata else "source_file"
+    where = f"{week_col} = '{safe_week}' AND {file_col} = '{safe_file}'"
+
+    count_rows = _run_sql(f"SELECT COUNT(*) AS n FROM {table_name} WHERE {where}")
     rows_to_delete = int(count_rows[0][0] or 0) if count_rows else 0
 
     if rows_to_delete == 0:
         return 0
 
-    _execute(
-        f"""
-        DELETE FROM {table_name}
-        WHERE week = '{safe_week}'
-          AND content_type = '{safe_type}'
-          AND source_file LIKE '%/{safe_file}'
-        """
-    )
+    _execute(f"DELETE FROM {table_name} WHERE {where}")
     return rows_to_delete
 
 
@@ -684,7 +687,10 @@ def delete_curriculum_file(req: DeleteFileRequest):
     remediation may be needed.
     """
     catalog, schema, volume, week, file_name = _parse_volume_path(req.path)
-    content_type = _volume_folder_to_content_type(req.path)
+    # Called for its validation side-effect only: it raises 400 if the folder
+    # segment isn't markdown/pdfs/quizzes. The returned content_type is no
+    # longer used as a delete predicate — see _delete_from_table for why.
+    _volume_folder_to_content_type(req.path)
 
     # Enforce that callers can only delete from the configured curriculum root.
     expected_prefix = f"/Volumes/{catalog}/{schema}/{volume}"
@@ -694,7 +700,7 @@ def delete_curriculum_file(req: DeleteFileRequest):
     _delete_bronze_file(req.path)
 
     try:
-        silver_rows = _delete_from_table(SILVER_TABLE, week, file_name, content_type)
+        silver_rows = _delete_from_table(SILVER_TABLE, week, file_name)
     except HTTPException as exc:
         raise HTTPException(
             status_code=500,
@@ -705,7 +711,7 @@ def delete_curriculum_file(req: DeleteFileRequest):
         ) from exc
 
     try:
-        vector_rows = _delete_from_table(VECTOR_TABLE, week, file_name, content_type)
+        vector_rows = _delete_from_table(VECTOR_TABLE, week, file_name, json_metadata=True)
     except HTTPException as exc:
         raise HTTPException(
             status_code=500,
