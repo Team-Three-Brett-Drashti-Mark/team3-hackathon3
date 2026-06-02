@@ -196,9 +196,15 @@ def guide_response(state: dict) -> dict:
         "IMPORTANT: Use the conversation history to understand what topic the student is referring to — "
         "especially if their message is a follow-up like 'what do you mean?' or 'can you explain that?'. "
         "Respond in 3-4 sentences. "
-        "First, name the specific concept from the material they should focus on. "
-        "Then ask one targeted question about what they have already tried with that concept. "
-        "Finally, tell them which part of the lesson to review — do NOT explain how to apply it."
+        # The student is explicitly asking for the answer, so the response must
+        # OPEN by naming that and declining — otherwise the coaching reads like
+        # the bot simply chose not to answer, instead of a deliberate guardrail.
+        "FIRST, in one warm, non-preachy sentence, tell the student directly that you can't give them "
+        "the answer or write the code for them — because the goal is for them to build the understanding "
+        "themselves. "
+        "THEN name the specific concept from the material they should focus on. "
+        "THEN ask one targeted question about what they have already tried with that concept. "
+        "FINALLY, tell them which part of the lesson to review — do NOT explain how to apply it."
     )
 
     response = client.chat.completions.create(
@@ -236,6 +242,9 @@ def structured_hint(state: dict) -> dict:
         "IMPORTANT: Use the conversation history to stay on the topic already being discussed. "
         "Do not introduce a new concept unless the conversation history clearly shows the topic shifted.\n\n"
         "Follow this structure in your response:\n"
+        # Still an answer-seeking turn, so keep the guardrail explicit — but
+        # briefly, since attempt 1 already said it; don't belabor the refusal.
+        "0. In a short opening clause, remind the student you won't hand over the direct answer or code.\n"
         "1. Name the key concept they need (draw from the conversation and material above).\n"
         "2. Explain that concept in 1-2 plain-English sentences.\n"
         "3. Give a SHORT analogous example using DIFFERENT values than the student's question.\n"
