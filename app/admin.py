@@ -942,8 +942,11 @@ def get_audit_log(page: int = 1, limit: int = 50, intent: str | None = None):
     offset = (page - 1) * limit
     where = f"WHERE intent = '{intent}'" if intent else ""
     count_sql = f"SELECT COUNT(*) FROM interaction_logs {where}"
+    # system_output is the model's reply. It must be selected here — the audit
+    # UI's expandable row renders entry.system_output as the "Pathwise reply"
+    # (see frontend AuditLog/LogRow.jsx), so omitting it leaves that panel blank.
     data_sql = f"""
-      SELECT timestamp, session_id, user_input, intent, attempt
+      SELECT timestamp, session_id, user_input, system_output, intent, attempt
       FROM interaction_logs
       {where}
       ORDER BY timestamp DESC
@@ -958,8 +961,9 @@ def get_audit_log(page: int = 1, limit: int = 50, intent: str | None = None):
             "timestamp": r[0],
             "session_id": r[1],
             "user_input": r[2],
-            "intent": r[3],
-            "attempt": r[4],
+            "system_output": r[3],
+            "intent": r[4],
+            "attempt": r[5],
         }
         for r in data_rows
     ]
