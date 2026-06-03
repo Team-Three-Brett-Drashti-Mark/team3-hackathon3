@@ -54,13 +54,13 @@ _ANSWER_SEEKING_KEYWORDS = [
     "i want the answer", "want the answer", "i need the answer", "need the answer",
     "can i have the answer", "just have the answer", "just code it", "code it for me",
     "just show me", "tell me the answer", "give me the solution", "just give me",
-    "can you just give", "just need the answer", "give me an answer",
+    "can you just give", "just need the answer", "give me an answer", "can you code this for me"
 ]
 
 _OFF_TOPIC_KEYWORDS = [
     "weather", "sports", "news", "movie", "music", "game", "recipe",
     "politics", "stock", "crypto", "dating", "taxes", "celebrity", "fashion", "travel", "fitness", "diet", "horoscope",
-    "podcast", "streaming", "concert", "festival",  "mortgage", "insurance", "shopping", "coupon", "lottery", "gambling", "social media", "meme", "viral", "influencer", "youtube", "tiktok", "religion", "astrology", "conspiracy", "election", "war", "lawsuit", "relationship", "parenting", "pets", "gardening", "diy", "car",
+    "podcast", "streaming", "concert", "festival",  "mortgage", "insurance", "shopping", "coupon", "lottery", "gambling", "social media", "meme", "viral", "influencer", "youtube", "tiktok", "religion", "astrology", "conspiracy", "election", "war", "lawsuit", "relationship", "parenting", "pets", "gardening", "diy", "car", "hurt", "depressed", "pain"
 ]
 
 
