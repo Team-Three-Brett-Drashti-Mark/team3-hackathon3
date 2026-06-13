@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: pathwise
+    runtime: python
+    buildCommand: |
+      pip install -r requirements.txt
+      cd frontend && npm ci && npm run build && cd ..
+    startCommand: uvicorn app.api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABRICKS_HOST
+        sync: false
+      - key: DATABRICKS_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
