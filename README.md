@@ -9,10 +9,10 @@ We built a private learning assistant that sits directly on top of a program's c
 Instead of just answering questions like a typical chatbot, our system acts as a guide. When students ask questions in natural language, it points them to the right material, asks follow-up questions, and helps them think through the problem without giving the final answer. Meanwhile, instructors and administrators gain deep visibility into what's actually happening: which topics are asked about most, where students get stuck, and which parts of the curriculum are heavily referenced.
 
 ## Runtime Modes
-Pathwise now supports two ways of running:
+Pathwise runs in two ways:
 
 * Local development mode for iteration on a laptop or workstation.
-* Hosted Databricks Apps deployment for a single hosted web app inside Databricks.
+* Hosted deployment on Render as a single public web service.
 
 In local development, the project runs as two processes:
 
@@ -21,20 +21,19 @@ In local development, the project runs as two processes:
 
 The Vite dev server proxies all `/admin`, `/chat`, and `/quiz` requests to the backend automatically, so no separate API base URL configuration is needed during development.
 
-In the hosted Databricks App, the architecture is different:
+In the hosted Render deployment, the frontend and backend are a single service on one origin:
 
 * `app/api.py` serves the built React frontend from `frontend/dist`
-* the frontend calls `/chat` using a relative URL instead of a hardcoded localhost backend
+* the frontend calls `/chat` using a relative URL, so it works on the same origin without a hardcoded backend host
 * `app/api.py` also provides static asset serving and SPA fallback routing
 * `app/main.py` prefers runtime-injected environment variables and uses `.env` only as a local fallback
 * `app/logger.py` writes fallback logging information to stdout as well as `app.log`
 
-## Current Databricks App Status
-A Databricks App named `pathwise` has already been deployed from this repo in the current workspace. The deployment source path is the repo root:
+## Current Deployment
+Pathwise is deployed on **Render** as a web service named `pathwise`, built directly from this repo's `render.yaml`. Render hosts the web tier; the data and retrieval backend still live in Databricks (Unity Catalog, Vector Search, and Delta logging), which the service reaches using the `DATABRICKS_HOST` / `DATABRICKS_TOKEN` credentials.
 
-`/Workspace/Repos/w.brett.coleman@gmail.com/team3-hackathon3`
-
-The hosted deployment is driven by the repo-root `app.yaml` file.
+* Student app: https://pathwise-8vr8.onrender.com
+* Admin dashboard: https://pathwise-8vr8.onrender.com/#/admin
 
 ## Architecture & Pipeline
 We designed a robust Bronze, Silver, Gold data pipeline:
@@ -59,7 +58,8 @@ A core feature of the product is ensuring students *learn* rather than copy-past
 * **Vector DB:** Databricks Vector Search (`capstone.vector_layer.curriculum_semantic_index`)
 * **RAG:** Custom implementation via `databricks-sdk` + `databricks-vectorsearch`
 * **Frontend:** React 19 + Vite
-* **Infrastructure:** Databricks (workspace, Unity Catalog, Vector Search, Databricks Apps)
+* **Hosting:** Render (single Python web service built from `render.yaml`)
+* **Data & Retrieval:** Databricks (Unity Catalog, Vector Search, Delta logging)
 * **CI/CD:** GitHub
 
 ---
@@ -81,7 +81,7 @@ You will also need:
 * A **Groq API key**.
 * A **Databricks personal access token** for local development and Databricks SDK access.
 
-For Databricks Apps deployment, the app runtime requires these environment variables or secrets:
+For the hosted Render deployment, the service requires these environment variables (configured as secrets in the Render dashboard):
 
 * `GROQ_API_KEY`
 * `DATABRICKS_HOST`
@@ -145,6 +145,7 @@ groq
 python-dotenv
 fastapi
 uvicorn
+python-multipart
 databricks-sdk
 databricks-vectorsearch
 ```
@@ -187,53 +188,47 @@ Open `http://localhost:5173` in your browser for the student view, or `http://lo
 
 ---
 
-## Databricks Apps Deployment
+## Render Deployment
 
-This repo can be deployed as a Databricks App from the repo root. The deployment is defined by `app.yaml` at the top level of the repository.
+The app is deployed to Render as a single web service, defined by `render.yaml` at the repo root. Render builds the frontend and runs the FastAPI backend that serves it, so the frontend and API share one origin.
 
 ### Hosted app behavior
 
-In the hosted app:
+In the hosted service:
 
-* the React frontend is built into `frontend/dist`
-* FastAPI serves the built frontend and the `/chat` API from the same origin
-* browser requests use a relative `/chat` path, so no localhost-specific API URL is required in production
+* the React frontend is built into `frontend/dist` during the Render build step
+* FastAPI serves the built frontend and the `/chat` + `/admin/*` APIs from the same origin
+* browser requests use relative paths, so no environment-specific API URL is required in production
 * `app/api.py` serves static files and SPA fallback routes
 
-### Required app secrets
+### How `render.yaml` is configured
 
-Configure these three secret-backed environment variables for the Databricks App:
-
-* `GROQ_API_KEY`
-* `DATABRICKS_HOST`
-* `DATABRICKS_TOKEN`
+* **Runtime:** Python web service
+* **Build command** — installs Python deps, then builds the frontend:
+  ```bash
+  pip install -r requirements.txt
+  cd frontend && npm ci && npm run build && cd ..
+  ```
+* **Start command:** `uvicorn app.api:app --host 0.0.0.0 --port $PORT` (Render injects `$PORT`)
+* **Secrets:** `GROQ_API_KEY`, `DATABRICKS_HOST`, and `DATABRICKS_TOKEN` are declared with `sync: false`, so their values are set in the Render dashboard and never committed to git
 
 ### Deploy steps
 
-1. Create a Databricks App asset.
-2. Use the app name you want for the deployment, such as `pathwise`.
-3. Set the app source path to:
-   ` /Workspace/Repos/w.brett.coleman@gmail.com/team3-hackathon3 `
-4. Ensure the repo root is used as the deployment root so the app picks up `app.yaml`.
-5. Configure the three required secrets or environment variables:
+1. In Render, create a new **Blueprint** from this repository (Render reads `render.yaml`), or a Web Service pointed at the repo.
+2. Set the three secret values in the Render dashboard:
    * `GROQ_API_KEY`
    * `DATABRICKS_HOST`
    * `DATABRICKS_TOKEN`
-6. Start the deployment.
-7. Watch the Databricks App build logs for the steps defined in `app.yaml`:
-   * Python dependency installation from `requirements.txt`
-   * frontend dependency installation in `frontend/`
-   * frontend build into `frontend/dist`
-   * Uvicorn startup for `app.api:app`
-8. After deployment completes, verify:
-   * the app loads successfully in the browser
-   * the UI is served by the FastAPI app
+3. Deploy. Render runs the build command, then the start command.
+4. After deployment, verify:
+   * the app loads in the browser at the Render URL
    * `/health` returns an OK response
    * a sample `/chat` flow works end to end
+   * the admin dashboard at `/#/admin` loads metrics (the Databricks SQL warehouse must be running)
 
 ### Notes on the current deployment
 
-The existing app named `pathwise` was deployed from this repo root and uses secret-backed resources for the required runtime credentials. If you redeploy after code changes, deploy from the same repo path so the latest repo-root `app.yaml` is used.
+Render auto-deploys on pushes to the connected branch, so committing changes redeploys the app. The Databricks SQL warehouse that backs the admin metrics bills while it runs — keep its auto-stop low (~10 min) so it idles down between sessions. The first admin request after the warehouse idles waits ~15–30s while it wakes; that delay is Databricks-side, not Render.
 
 ---
 
@@ -271,15 +266,15 @@ team3-hackathon3/
 │   │   ├── student/         # All student-facing UI (see Frontend Architecture below)
 │   │   └── admin/           # Admin dashboard (see Frontend Architecture below)
 │   ├── vite.config.js       # Dev server proxy — /admin, /chat, /quiz → localhost:8000
-│   └── dist/                # Production build output served by FastAPI in Databricks Apps
+│   └── dist/                # Production build output served by FastAPI on Render
 ├── guardrails/
 │   └── no_direct_answers.py
 ├── retrieval/
 │   └── retriever.py         # Databricks Vector Search client — returns chunks with metadata
 ├── start.sh                 # One-command local startup (Mac / Linux)
 ├── start.ps1                # One-command local startup (Windows PowerShell)
-├── app.yaml                 # Databricks Apps build/run manifest used from the repo root
-├── databricks.yml           # Declarative Automation Bundles config for workspace development
+├── render.yaml              # Render build/start manifest used for deployment
+├── databricks.yml           # Declarative Automation Bundles config for the data/ingestion workspace
 ├── requirements.txt         # Python backend dependencies
 └── .env                     # Local secrets for development only — never commit this file
 ```
@@ -382,7 +377,7 @@ The student view has two drag handles:
 * Guardrail logic (curriculum / attempt-1 / attempt-2 / hard-block escalation)
 * Answer-leak detection with static fallbacks
 * Interaction logging to `capstone.logging.interaction_logs`
-* Databricks Apps hosting support
+* Render hosting (public web service)
 * Admin dashboard — usage metrics, curriculum volume management, audit log
 
 ### Phase 2: Scaled Product Version
