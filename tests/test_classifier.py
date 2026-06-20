@@ -99,6 +99,26 @@ class TestOffTopicIntent:
         result = apply_classify(phrase)
         assert result["intent"] == "off_topic", f"Expected off_topic for: {phrase!r}"
 
+    @pytest.mark.parametrize("phrase", [
+        "🔥💀🌈",                 # emoji-only
+        "हाय आप कैसे हैं",        # Devanagari (Hindi) — no Latin letters
+        "你好吗",                  # Han script
+        "!?!? ...",               # punctuation/symbols only
+        "1234 5678",              # digits only
+        "",                       # empty
+    ])
+    def test_non_latin_or_symbol_only_is_off_topic(self, phrase):
+        # Messages with no Latin-script letters can't be curriculum questions and
+        # must never reach the LLM — they previously defaulted to curriculum.
+        result = apply_classify(phrase)
+        assert result["intent"] == "off_topic", f"Expected off_topic for: {phrase!r}"
+
+    def test_mixed_script_with_latin_word_still_classifies_normally(self):
+        # A message containing a real Latin/Python word is a legitimate question
+        # even if it also includes non-Latin characters.
+        result = apply_classify("हाय print() कैसे काम करता है")
+        assert result["intent"] == "curriculum"
+
 
 # ---------------------------------------------------------------------------
 # Attempt escalation
