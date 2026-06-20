@@ -64,10 +64,32 @@ _OFF_TOPIC_KEYWORDS = [
 ]
 
 
+# Matches any Latin-script letter (covers accented chars like é/ñ so legitimately
+# punctuated English questions aren't misread as having no letters). Used to
+# distinguish real curriculum questions from emoji/non-Latin/symbol-only input.
+_LATIN_LETTER = re.compile(r"[A-Za-zÀ-ɏ]")
+
+
+def _has_latin_content(text: str) -> bool:
+    """True if the message contains at least one Latin-script letter."""
+    return bool(_LATIN_LETTER.search(text))
+
+
 def classify_intent(state: PathwiseState) -> dict:
     """Routes the student message to one of three intents."""
-    text = state["user_input"].lower()
-    if any(kw in text for kw in _ANSWER_SEEKING_KEYWORDS):
+    raw = state["user_input"]
+    text = raw.lower()
+    if not _has_latin_content(raw):
+        # The curriculum is an English-language Python bootcamp, so a real
+        # learning question always contains Latin-script letters. A message with
+        # none — emoji-only ("🔥💀🌈"), a non-Latin script ("हाय आप कैसे हैं"),
+        # or pure punctuation/symbols — cannot be a curriculum question. Without
+        # this guard such inputs fall through to the curriculum default below and
+        # get sent to the LLM, which dutifully answers them (even replying in the
+        # student's language). Route them to the static off_topic handler so they
+        # never reach the model.
+        intent = "off_topic"
+    elif any(kw in text for kw in _ANSWER_SEEKING_KEYWORDS):
         intent = "answer_seeking"
     elif any(kw in text for kw in _OFF_TOPIC_KEYWORDS):
         intent = "off_topic"
