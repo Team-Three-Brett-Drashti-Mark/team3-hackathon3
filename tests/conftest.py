@@ -19,10 +19,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # reaching the real package.
 # ---------------------------------------------------------------------------
 
+# The stub must mirror the SUBMODULE paths the app imports, not just the top
+# package. app/admin.py and app/logger.py do
+#   from databricks.sdk.service.sql import StatementResponse, StatementState
+# so a bare `databricks.sdk` MagicMock isn't enough — Python then tries to import
+# the real `databricks.sdk.service.sql` submodule and fails with "not a package".
+# We therefore register every dotted level we import from. StatementState is
+# accessed as an enum (StatementState.SUCCEEDED, etc.); MagicMock caches attribute
+# access, so each member is a stable object and set membership works.
 _databricks_sdk = MagicMock()
 _databricks_sdk.WorkspaceClient = MagicMock
+_databricks_sql = MagicMock()  # stands in for databricks.sdk.service.sql
 sys.modules.setdefault("databricks", MagicMock())
 sys.modules.setdefault("databricks.sdk", _databricks_sdk)
+sys.modules.setdefault("databricks.sdk.service", MagicMock())
+sys.modules.setdefault("databricks.sdk.service.sql", _databricks_sql)
 sys.modules.setdefault("databricks.vectorsearch", MagicMock())
 sys.modules.setdefault("databricks.vectorsearch.client", MagicMock())
 
