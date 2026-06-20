@@ -80,3 +80,23 @@ export async function fetchAuditLog({ page = 1, limit = 50, intent = "" } = {}) 
   if (!res.ok) throw new Error(await readErrorDetail(res, `Audit log fetch failed: ${res.status}`));
   return res.json(); // { entries: [...], total, page, limit }
 }
+
+// Natural-language query over the interaction logs. The backend guards scope
+// strictly to the logging tables, so out-of-scope questions come back with
+// { refused: true } rather than an error — callers should render the answer
+// regardless of refused, and only fall into catch() for real failures.
+export async function askQuestion(question) {
+  const res = await fetch(`${base()}/admin/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) throw new Error(await readErrorDetail(res, `Ask failed: ${res.status}`));
+  return res.json(); // { refused, answer, sql, columns, rows, viz }
+}
+
+export async function fetchDashboard() {
+  const res = await fetch(`${base()}/admin/metrics/dashboard`);
+  if (!res.ok) throw new Error(await readErrorDetail(res, `Dashboard fetch failed: ${res.status}`));
+  return res.json(); // { escalation_funnel: [...], attempt_distribution: [...] }
+}
