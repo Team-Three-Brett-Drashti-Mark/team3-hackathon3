@@ -12,6 +12,8 @@ from pydantic import BaseModel
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementResponse, StatementState
 
+from app import ask_agent
+
 logger = logging.getLogger(__name__)
 
 # States that mean a SQL statement has finished (success or otherwise).
@@ -292,6 +294,28 @@ def _query_view(view_name: str) -> list[dict]:
     cols = [c.name for c in schema.columns] if schema and schema.columns else []
     rows = (resp.result.data_array or []) if resp.result else []
     return [dict(zip(cols, row)) for row in rows] if cols else []
+
+
+def _run_sql_with_columns(sql: str) -> tuple[list[str], list[list]]:
+    """
+    Execute SQL and return (column_names, rows) together.
+
+    The Ask agent (app/ask_agent.py) needs column names alongside the raw rows so
+    the frontend can label table headers and pick chart axes — _run_sql() returns
+    rows only, and _query_view() returns dicts (which lose column ORDER, something
+    the chart axes care about). This helper bridges the gap by reading the column
+    names straight from the statement-execution manifest, preserving their order.
+
+    Execution flows through the same _execute() used everywhere else, which pins
+    catalog="capstone", schema="logging" — that pin is guardrail layer 4 for the
+    Ask agent: even an unqualified table name can only resolve inside the logging
+    schema.
+    """
+    resp = _execute(sql)
+    schema = resp.manifest.schema if resp.manifest else None
+    cols = [c.name for c in schema.columns] if schema and schema.columns else []
+    rows = (resp.result.data_array or []) if resp.result else []
+    return cols, rows
 
 
 # ── View column normalizers ───────────────────────────────────────────────────
@@ -973,3 +997,113 @@ def get_audit_log(page: int = 1, limit: int = 50, intent: str | None = None):
         "page": page,
         "limit": limit,
     }
+
+
+# ── Ask (natural-language Q&A over the logs) ──────────────────────────────────
+
+class AskRequest(BaseModel):
+    question: str
+
+
+@router.post("/ask")
+def ask(req: AskRequest):
+    """
+    Answer a natural-language question about the interaction logs.
+
+    Delegates the entire guarded pipeline to ask_agent.answer_question, injecting
+    _run_sql_with_columns as the executor so the agent stays decoupled from the
+    Databricks SDK (and remains unit-testable offline). See app/ask_agent.py for
+    the four guardrail layers that scope this strictly to the logging tables.
+
+    A blank question is rejected up front with a 400 rather than being sent
+    through the LLM — there's nothing to classify or translate.
+    """
+    question = (req.question or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    try:
+        return ask_agent.answer_question(question, execute_sql=_run_sql_with_columns)
+    except HTTPException:
+        # _execute() raises structured HTTPExceptions (e.g. warehouse timeout) —
+        # let those propagate unchanged so the UI shows the real cause.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ask failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+# ── Ask-tab dashboard metrics ─────────────────────────────────────────────────
+# Compact, log-specific metrics rendered alongside the Ask query box. These are
+# pre-built (not LLM-generated) so the dashboard is always populated and fast,
+# independent of whatever the admin happens to ask. Cached like the overview
+# metrics since they're 7-day aggregates where ~60s staleness is fine.
+
+_dashboard_cache: dict | None = None
+_dashboard_cache_ts: float = 0.0
+_DASHBOARD_TTL = 60.0
+
+
+@router.get("/metrics/dashboard")
+def get_dashboard():
+    """
+    Return log-focused dashboard metrics for the Ask page.
+
+    Payload:
+      escalation_funnel — sessions reaching attempt >=1 / >=2 / >=3, showing how
+                          many conversations escalated through the guardrail tiers.
+      attempt_distribution — interaction counts grouped by attempt number, for a
+                          quick bar chart of where students land.
+
+    Both come straight from interaction_logs. Results are cached for 60s to avoid
+    re-hitting the warehouse on every Ask-page visit.
+    """
+    global _dashboard_cache, _dashboard_cache_ts
+
+    now = time.monotonic()
+    if _dashboard_cache is not None and (now - _dashboard_cache_ts) < _DASHBOARD_TTL:
+        return _dashboard_cache
+
+    # Funnel: COUNT(DISTINCT session) at each escalation threshold. Using >= means
+    # each tier is a subset of the previous one, so the bars read as a funnel.
+    funnel_rows = _run_sql(
+        """
+        SELECT
+          COUNT(DISTINCT session_id) AS reached_1,
+          COUNT(DISTINCT CASE WHEN attempt >= 2 THEN session_id END) AS reached_2,
+          COUNT(DISTINCT CASE WHEN attempt >= 3 THEN session_id END) AS reached_3
+        FROM interaction_logs
+        """
+    )
+    r = funnel_rows[0] if funnel_rows else [0, 0, 0]
+    escalation_funnel = [
+        {"label": "Attempt 1+", "count": int(r[0] or 0)},
+        {"label": "Attempt 2+", "count": int(r[1] or 0)},
+        {"label": "Attempt 3+", "count": int(r[2] or 0)},
+    ]
+
+    # Distribution: interactions per attempt number, ordered so the bar chart reads
+    # 1 → 2 → 3 left to right.
+    dist_rows = _run_sql(
+        """
+        SELECT attempt, COUNT(*) AS n
+        FROM interaction_logs
+        GROUP BY attempt
+        ORDER BY attempt
+        """
+    )
+    attempt_distribution = [
+        {"label": f"Attempt {int(row[0])}", "count": int(row[1] or 0)}
+        for row in dist_rows
+        if row[0] is not None
+    ]
+
+    payload = {
+        "escalation_funnel": escalation_funnel,
+        "attempt_distribution": attempt_distribution,
+    }
+    _dashboard_cache = payload
+    _dashboard_cache_ts = now
+    return payload
