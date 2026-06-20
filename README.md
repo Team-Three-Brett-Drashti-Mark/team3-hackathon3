@@ -257,7 +257,8 @@ ATTEMPT: ...
 team3-hackathon3/
 ├── app/
 │   ├── api.py               # FastAPI app — /chat, /admin/* endpoints, hosted static serving
-│   ├── admin.py             # Admin API router — metrics, curriculum volume, audit log
+│   ├── admin.py             # Admin API router — metrics, curriculum volume, audit log, /ask
+│   ├── ask_agent.py         # Guarded text-to-SQL agent powering the admin Ask tab (scope + SQL validation)
 │   ├── logger.py            # Interaction logger with Delta write + stdout/app.log fallback
 │   └── main.py              # LangGraph graph and runtime env loading logic
 ├── frontend/
