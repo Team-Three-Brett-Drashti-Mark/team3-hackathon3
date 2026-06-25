@@ -32,7 +32,8 @@ In the hosted Render deployment, the frontend and backend are a single service o
 ## Current Deployment
 Pathwise is deployed on **Render** as a web service named `pathwise`, built directly from this repo's `render.yaml`. Render hosts the web tier; the data and retrieval backend still live in Databricks (Unity Catalog, Vector Search, and Delta logging), which the service reaches using the `DATABRICKS_HOST` / `DATABRICKS_TOKEN` credentials.
 
-* Student app: https://pathwise-8vr8.onrender.com
+* Landing page: https://pathwise-8vr8.onrender.com
+* Student app: https://pathwise-8vr8.onrender.com/#/student
 * Admin dashboard: https://pathwise-8vr8.onrender.com/#/admin
 
 ## Architecture & Pipeline
@@ -184,7 +185,7 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 
 The script starts both services, waits for the backend health check, and shuts both down cleanly on `Ctrl+C`.
 
-Open `http://localhost:5173` in your browser for the student view, or `http://localhost:5173/#/admin` for the admin dashboard.
+Open `http://localhost:5173` in your browser for the landing page, then choose the student platform (`/#/student`) or the admin dashboard (`/#/admin`).
 
 ---
 
@@ -263,7 +264,8 @@ team3-hackathon3/
 │   └── main.py              # LangGraph graph and runtime env loading logic
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx          # Root hash router — #/admin → AdminApp, default → StudentApp
+│   │   ├── App.jsx          # Root hash router — #/admin → AdminApp, #/student → StudentApp, default → LandingPage
+│   │   ├── landing/         # Landing page entry point with student/admin cards
 │   │   ├── student/         # All student-facing UI (see Frontend Architecture below)
 │   │   └── admin/           # Admin dashboard (see Frontend Architecture below)
 │   ├── vite.config.js       # Dev server proxy — /admin, /chat, /quiz → localhost:8000
@@ -284,11 +286,12 @@ team3-hackathon3/
 
 ## Frontend Architecture
 
-`App.jsx` at the root is a thin hash-based router: visiting `/#/admin` renders the admin dashboard, everything else renders the student view.
+`App.jsx` at the root is a thin hash-based router: visiting `/#/admin` renders the admin dashboard, `/#/student` renders the student view, and everything else renders the landing page.
 
 ```text
 frontend/src/
-├── App.jsx                        # Root router — hash #/admin → AdminApp, default → StudentApp
+├── App.jsx                        # Root router — hash #/admin → AdminApp, #/student → StudentApp, default → LandingPage
+├── landing/index.jsx              # Landing page — H1 + tagline + student/admin entry cards
 ├── App.css                        # Global styles (e.g. .thinking animation)
 ├── student/
 │   ├── index.jsx                  # Student view root — layout, drag handles, transition handlers

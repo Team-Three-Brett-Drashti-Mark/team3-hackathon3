@@ -1,12 +1,19 @@
 import { useState, useEffect } from "react";
 import "./App.css";
+import LandingPage from "./landing";
 import StudentApp from "./student";
 import AdminApp from "./admin";
 
 // Determines which view to show based on the URL hash.
-// Visit /#/admin for the admin dashboard; everything else shows the student view.
+//   #/admin   → admin dashboard
+//   #/student → student learning platform
+//   anything else (empty hash, #/, etc.) → the landing page entry point
+// Keeping this hash-based keeps the deployment a single static SPA with no
+// server-side routing, which is what the Render single-service setup expects.
 function getView() {
-  return window.location.hash === "#/admin" ? "admin" : "student";
+  if (window.location.hash === "#/admin") return "admin";
+  if (window.location.hash === "#/student") return "student";
+  return "landing";
 }
 
 export default function App() {
@@ -18,5 +25,7 @@ export default function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
-  return view === "admin" ? <AdminApp /> : <StudentApp />;
+  if (view === "admin") return <AdminApp />;
+  if (view === "student") return <StudentApp />;
+  return <LandingPage />;
 }
