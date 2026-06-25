@@ -47,20 +47,105 @@ class PathwiseState(TypedDict):
 MIN_RELEVANCE_SCORE = 0.60
 
 _ANSWER_SEEKING_KEYWORDS = [
-    "what is the answer", "give me the answer", "just tell me",
-    "what's the solution", "what is the solution", "solve this for me",
-    "write the code", "write me the code", "do it for me", "show me the solution",
-    "answer is", "what should i write", "what do i write", "give me the code",
+    # Direct answer demands
+    "what is the answer", "give me the answer", "tell me the answer",
     "i want the answer", "want the answer", "i need the answer", "need the answer",
-    "can i have the answer", "just have the answer", "just code it", "code it for me",
-    "just show me", "tell me the answer", "give me the solution", "just give me",
-    "can you just give", "just need the answer", "give me an answer", "can you code this for me"
+    "give me an answer", "just need the answer", "can i have the answer",
+    "just have the answer", "just tell me", "just give me",
+    "what's the answer", "whats the answer", "tell me what it is",
+    "can you just tell me", "please just tell me", "i just want to know the answer",
+    "what's the right answer", "what is the correct answer", "give me the right answer",
+    "answer this for me", "just answer it", "answer the question",
+
+    # Solution requests
+    "what's the solution", "what is the solution", "solve this for me",
+    "show me the solution", "give me the solution", "answer is",
+    "what's the correct solution", "what is the correct solution",
+    "what should the solution be", "just solve it", "solve it for me",
+    "can you solve this", "how do you solve this", "solve this problem for me",
+    "what's the final answer", "final answer is", "what does the answer look like",
+
+    # Code generation requests
+    "write the code", "write me the code", "give me the code",
+    "just code it", "code it for me", "can you code this for me", "can i have the code",
+    "write this code for me", "write me a solution", "write the solution",
+    "code this for me", "give me a working solution", "give me the full code",
+    "give me the complete code", "write the full solution", "just write it for me",
+    "can you write this for me", "write a program that", "give me a program that",
+    "implement this for me", "just implement it", "make it work for me",
+    "complete this code", "finish this code for me", "fill in the code",
+    "write the function", "write the class",
+
+    # What to write
+    "what should i write", "what do i write", "what should i type",
+    "what do i type here", "what goes here", "what should go here",
+    "what do i put here", "what should i put", "tell me what to write",
+    "tell me what to type", "what should the code say",
+    "what should the function look like", "what should i return", "what should i output",
+
+    # Do it for me
+    "do it for me", "just do it for me", "can you do this for me",
+    "do this for me", "please do it for me", "you do it", "you do it for me",
+    "just do it", "can you just do it", "handle this for me",
+    "take care of it for me", "figure it out for me",
+
+    # Just show / reveal
+    "just show me", "can you just give", "show me how it's done",
+    "show me the answer", "show me the code", "just show me the result",
+    "show me what it should look like", "reveal the answer", "just reveal it",
+    "show me the working", "show me the output",
+
+    # Completed work
+    "give me the completed version", "give me the finished code",
+    "give me the working code", "give me a finished solution",
+    "give me the full solution", "what does the final code look like",
+    "what does the completed code look like", "what is the finished program",
+    "paste the answer", "paste the solution", "paste the code", 
 ]
 
 _OFF_TOPIC_KEYWORDS = [
-    "weather", "sports", "news", "movie", "music", "game", "recipe",
-    "politics", "stock", "crypto", "dating", "taxes", "celebrity", "fashion", "travel", "fitness", "diet", "horoscope",
-    "podcast", "streaming", "concert", "festival",  "mortgage", "insurance", "shopping", "coupon", "lottery", "gambling", "social media", "meme", "viral", "influencer", "youtube", "tiktok", "religion", "astrology", "conspiracy", "election", "war", "lawsuit", "relationship", "parenting", "pets", "gardening", "diy", "car", "hurt", "depressed", "pain"
+    # Entertainment & media
+    "movie", "music", "game", "podcast", "streaming", "concert", "festival",
+    "youtube", "tiktok", "meme", "viral", "influencer", "celebrity",
+    "tv show", "netflix", "anime", "video game", "trailer", "box office",
+    "album", "playlist", "twitch", "instagram", "reddit", "fan fiction", "comic book",
+
+    # News & current events
+    "news", "politics", "election", "war", "lawsuit", "conspiracy",
+    "breaking news", "headline", "protest", "government", "president",
+    "congress", "senate", "supreme court", "bill passed", "scandal", "impeachment",
+
+    # Finance
+    "stock", "crypto", "mortgage", "insurance", "taxes", "lottery", "gambling",
+    "bitcoin", "investing", "real estate", "interest rate", "credit score",
+    "401k", "nft", "hedge fund", "forex", "day trading",
+
+    # Sports
+    "sports", "nfl", "nba", "mlb", "soccer", "football", "basketball",
+    "baseball", "tennis", "golf", "olympics", "world cup", "fantasy sports",
+    "scores", "standings",
+
+    # Lifestyle & wellness
+    "recipe", "fitness", "diet", "fashion", "travel", "shopping", "coupon",
+    "gardening", "diy", "workout", "nutrition", "weight loss", "meal prep",
+    "skincare", "makeup", "home decor", "interior design", "cleaning tips",
+    "vacation", "hotel", "flight deals",
+
+    # Relationships & social
+    "dating", "relationship", "parenting", "social media", "pets",
+    "breakup", "divorce", "marriage", "friendship", "family drama",
+    "tinder", "online dating", "cheating", "hurt", "pain", "depressed",
+
+    # Beliefs & spirituality
+    "religion", "astrology", "horoscope", "zodiac", "tarot", "psychic",
+    "manifestation", "meditation", "prayer", "church", "spiritual",
+
+    # Transportation & home
+    "car", "truck", "suv", "motorcycle", "used car", "car repair", "oil change",
+    "home improvement", "plumbing", "electrician", "roof repair", "lawn care",
+
+    # Weather
+    "weather", "forecast", "hurricane", "tornado", "snow day", "temperature outside",
 ]
 
 
