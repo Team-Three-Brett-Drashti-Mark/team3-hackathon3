@@ -35,8 +35,8 @@ export const QUESTIONS = [
   },
   {
     unit: "Unit 1.2",
-    text: 'Get the length of the string "python".',
-    accepted: ['len("python")', "len('python')", "len(python)"],
+    text: 'Get the length of the string: language = "python".',
+    accepted: ['len(language)', "len(language)", "len(language)"],
     hint: "Python has a built-in function that counts items in any sequence.\nTry: len(your_string)",
   },
 ];
